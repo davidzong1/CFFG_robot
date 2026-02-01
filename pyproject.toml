@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools", "toml"]
+build-backend = "setuptools.build_meta"
+
+[tool.isort]
+atomic = true
+profile = "black"
+line_length = 150
+py_version = 311
+skip_glob = ["docs/*", "logs/*"]
+group_by_package = true
+
+exclude = [
+    "**/__pycache__",
+    "**/docs",
+    "**/logs",
+    ".git",
+    ".vscode",
+]
+
+extraPaths = [    
+    "/home/zwc/anaconda3/envs/g1/lib/python3.11/site-packages/",
+]
+
+typeCheckingMode = "basic"
+pythonVersion = "3.11"
+pythonPlatform = "Linux"
+enableTypeIgnoreComments = true
+
+[tool.black]
+line-length = 150
+target-version = ["py311"]

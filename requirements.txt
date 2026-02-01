@@ -1,0 +1,6 @@
+numpy
+git-lfs
+casadi
+torch==2.7.0
+setuptools
+matplotlib
