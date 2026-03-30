@@ -20,6 +20,7 @@ exclude = [
 
 extraPaths = [    
     "/home/zwc/anaconda3/envs/g1/lib/python3.11/site-packages/",
+    "/home/zwc/class_free_guide/three_party/mamba_selective_scan/",
 ]
 
 typeCheckingMode = "basic"
