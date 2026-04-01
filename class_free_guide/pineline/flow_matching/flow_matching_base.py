@@ -14,11 +14,12 @@ except ImportError:
 
 
 class FlowMatcherBase(nn.Module):
-    def __init__(self, model, cfg: FlowMatchingCfg):
+    def __init__(self, cfg: FlowMatchingCfg, model: Optional[nn.Module] = None):
         super().__init__()
         self.cfg = cfg
-        self.model = model
-        self.model.to(self.cfg.device)
+        if model is not None:
+            self.model = model
+            self.model.to(self.cfg.device)
         assert self.cfg.num_sample_steps > 0, "num_sample_steps must be greater than 0"
         assert self.cfg.real_denoise_step > 0, "real_denoise_step must be greater than 0"
         assert self.cfg.num_sample_steps >= self.cfg.real_denoise_step, "num_sample_steps must be greater than or equal to real_denoise_step"

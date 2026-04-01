@@ -1,29 +1,37 @@
 import torch
 import torch.nn as nn
 from typing import Optional
+from .mlp import MLP
+from .operator import ScaleShift
 
 
-class AdaLayerNorm(nn.Module):
+class ConditionEmbNorm(nn.Module):
+    """
+    One dimension LayerNorm with condition embedding, which is used to inject the condition information into the hidden state.
+    """
+
     def __init__(
         self,
-        embedding_dim: int,
+        emb_dim: int,
+        condition_dim: int,
+        hidden_dim: Optional[int] = None,
         norm_elementwise_affine: bool = False,
         norm_eps: float = 1e-5,
-        chunk_dim: int = 0,
     ):
         super().__init__()
-        self.chunk_dim = chunk_dim
-        output_dim = embedding_dim * 2
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(embedding_dim, output_dim)
-        self.norm = nn.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine)
+        self.shift_scale_layer = ScaleShift(
+            hidden_dim=emb_dim,
+            cond_dim=condition_dim,
+            mlp_hidden_dims=[hidden_dim] if hidden_dim is not None else None,
+            use_shift=True,
+        )
+        self.norm = nn.LayerNorm(emb_dim, norm_eps, norm_elementwise_affine)
 
     def forward(
         self,
         x: torch.Tensor,
-        temb: Optional[torch.Tensor] = None,
+        condition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        temb = self.linear(self.silu(temb))
-        scale, shift = temb.chunk(2, dim=1)
-        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        x = self.shift_scale_layer(x, condition)
+        x = self.norm(x)
         return x

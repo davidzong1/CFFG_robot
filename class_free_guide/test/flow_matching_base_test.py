@@ -75,7 +75,7 @@ def sample_gaussians(batch_size: int, device: torch.device) -> tuple[torch.Tenso
 def train_flow_matching(config: FlowDemoConfig):
     device = torch.device(config.device)
     model = MLP(input_dim=2 + 1, hidden_dims=config.model_hidden_dim, output_dim=2, activation="elu")
-    flow = FlowMatcherBase(model, config.cfg)
+    flow = FlowMatcherBase(cfg=config.cfg, model=model)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
     for step in range(1, config.train_steps + 1):

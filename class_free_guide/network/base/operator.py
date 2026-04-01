@@ -5,6 +5,7 @@ from class_free_guide.network.utils.deprecate import deprecate
 from .activate import GELU, GEGLU, ApproximateGELU, SwiGLU, LinearActivation
 import math
 from .mlp import MLP
+from typing import Optional
 
 
 class FeedForward(nn.Module):
@@ -102,21 +103,29 @@ class ScaleShift(nn.Module):
     A module that applies a scale and shift to the input tensor based on a conditioning vector.
     """
 
-    def __init__(self, hidden_dim: int, cond_dim: int, mlp_hidden_dims: list[int], use_shift: bool = True):
+    def __init__(self, hidden_dim: int, cond_dim: int, mlp_hidden_dims: Optional[list[int]] = None, use_shift: bool = True):
         super().__init__()
         # 条件到(scale, shift)的映射，一次输出2 * hidden_dim后再拆成gamma, beta
         self.use_shift = use_shift
+        self.silu = nn.SiLU()
         if use_shift:
-            self.proj = MLP(cond_dim, 2 * hidden_dim, mlp_hidden_dims, activation_fn="geglu", bias=True)
+            if mlp_hidden_dims is None:
+                self.proj = nn.Linear(cond_dim, 2 * hidden_dim)
+            else:
+                self.proj = MLP(cond_dim, 2 * hidden_dim, mlp_hidden_dims, activation_fn="swish", bias=True)
         else:
-            self.proj = MLP(cond_dim, hidden_dim, mlp_hidden_dims, activation_fn="geglu", bias=True)
+            if mlp_hidden_dims is None:
+                self.proj = nn.Linear(cond_dim, hidden_dim)
+            else:
+                self.proj = MLP(cond_dim, hidden_dim, mlp_hidden_dims, activation_fn="swish", bias=True)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # (batch, cond_dim) -> (batch, 2 * hidden_dim)
-        gamma_beta = self.proj(cond)
-        beta = torch.zeros_like(gamma_beta)
+        gamma_beta = self.proj(self.silu(cond))
         if self.use_shift:
             gamma, beta = gamma_beta.chunk(2, dim=-1)
-        # 将(condition)广播到序列维度
-        # y = (1 + gamma) * x + beta
-        return x * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            # 将(condition)广播到序列维度
+            # y = (1 + gamma) * x + beta
+            return x * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+        else:
+            return x * (1 + gamma_beta.unsqueeze(1))
