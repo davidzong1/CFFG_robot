@@ -19,6 +19,7 @@ class DitBlock(nn.Module):
         max_token_length=512,
         norm_elementwise_affine: bool = True,
         norm_eps: float = 1e-5,
+        use_positional_embedding: bool = True,
         use_attention_out_scale: bool = False,
         use_feed_scale_shift: bool = False,
         use_feed_out_scale: bool = True,
@@ -39,7 +40,7 @@ class DitBlock(nn.Module):
             norm_elementwise_affine=norm_elementwise_affine,
             norm_eps=norm_eps,
         )
-        self.pos_embed = SinusoidalPositionalEmbedding(hidden_dim, max_seq_length=num_attention_heads)
+        self.pos_embed = SinusoidalPositionalEmbedding(hidden_dim, max_seq_length=num_attention_heads) if use_positional_embedding else nn.Identity()
         self.self_attention_block = AttentionBlock(
             hidden_dim=hidden_dim,
             cross_hidden_dim=cross_attention_dim,
@@ -48,13 +49,13 @@ class DitBlock(nn.Module):
             attention_out_bias=attention_out_bias,
         )
         self.self_out_scale = (
-            ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, mlp_hidden_dims=condition_mlp_hidden_dim, activate=activate, use_shift=False)
+            ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, mlp_hidden_dims=condition_mlp_hidden_dim, use_shift=False)
             if use_attention_out_scale
             else nn.Identity()
         )
         self.feed_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
         self.feed_scale_shift = (
-            ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, mlp_hidden_dims=condition_mlp_hidden_dim, activate=activate, use_shift=True)
+            ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, mlp_hidden_dims=condition_mlp_hidden_dim, use_shift=True)
             if use_feed_scale_shift
             else nn.Identity()
         )
@@ -69,7 +70,7 @@ class DitBlock(nn.Module):
             inner_dim=ff_inner_dim,
         )
         self.feed_out_scale = (
-            ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, mlp_hidden_dims=condition_mlp_hidden_dim, activate=activate, use_shift=False)
+            ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, mlp_hidden_dims=condition_mlp_hidden_dim, use_shift=False)
             if use_feed_out_scale
             else nn.Identity()
         )
@@ -80,8 +81,7 @@ class DitBlock(nn.Module):
         hidden_input,
         condition_input,
         cross_input: Optional[torch.Tensor] = None,
-        self_attention_mask: Optional[torch.Tensor] = None,
-        cross_attention_mask: Optional[torch.Tensor] = None,
+        mask2d: Optional[torch.Tensor] = None,
     ):
         # input norm
         norm_hidden_state = self.self_norm(hidden_input, condition_input)
@@ -91,8 +91,7 @@ class DitBlock(nn.Module):
         attention_output = self.self_attention_block(
             hidden_input=norm_hidden_state_pos,
             cross_input=cross_input,
-            query_mask=self_attention_mask,
-            key_mask=cross_attention_mask,
+            mask2d=mask2d,
         )
         # dropout after attention
         attention_output = self.dropout(attention_output)

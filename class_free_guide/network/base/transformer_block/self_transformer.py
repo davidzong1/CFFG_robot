@@ -54,11 +54,11 @@ class SelfTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_input: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        mask2d: Optional[torch.Tensor] = None,
     ):
         norm_hidden_states = self.norm1(hidden_input)
         norm_hidden_states_pos = self.pos_embed(norm_hidden_states)
-        attention_output = self.self_attention(hidden_input=norm_hidden_states_pos, query_mask=attention_mask)
+        attention_output = self.self_attention(hidden_input=norm_hidden_states_pos, mask2d=mask2d)
         attention_output = self.final_dropout(attention_output)
         # feedforward residual connection
         ff_output = self.ff(norm_hidden_states)

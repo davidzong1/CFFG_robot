@@ -11,7 +11,7 @@ class AttentionBlock(nn.Module):
         cross_hidden_dim: Optional[int] = None,  # Key/Value 的输入维度
         num_attention_heads=8,
         max_token_length=512,
-        attentiion_out_bias: bool = True,
+        attention_out_bias: bool = True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -24,21 +24,19 @@ class AttentionBlock(nn.Module):
         self._WQ = nn.Linear(hidden_dim, hidden_dim)
         self._WK = nn.Linear(self.cross_hidden_dim, hidden_dim)
         self._WV = nn.Linear(self.cross_hidden_dim, hidden_dim)
-        self._WO = nn.Linear(hidden_dim, hidden_dim) if attentiion_out_bias else nn.Identity()  # head data to hidden data
+        self._WO = nn.Linear(hidden_dim, hidden_dim) if attention_out_bias else nn.Identity()  # head data to hidden data
 
     def forward(
         self,
         hidden_input,
         cross_input: Optional[torch.Tensor] = None,
-        query_mask: Optional[torch.Tensor] = None,
-        key_mask: Optional[torch.Tensor] = None,
+        mask2d: Optional[torch.Tensor] = None,
     ):
         """
         Args:
             hidden_input: (batch,token_length, seq_len, hidden_dim)
             cross_input: (batch,token_length, cross_seq_len, cross_hidden_dim)
-            query_mask: (batch) query mask
-            key_mask: (batch) key mask
+            mask2d: (batch, seq_len, cross_seq_len) 2D mask
         """
         batch_size, seq_len, _ = hidden_input.shape
         assert seq_len <= self.max_token_length, f"Sequence length {seq_len} exceeds maximum {self.max_token_length}"
@@ -59,30 +57,14 @@ class AttentionBlock(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim**0.5)
 
         # 2.5 applying masks if provided
-        if query_mask is not None or key_mask is not None:
-            if query_mask is not None:
-                assert query_mask.shape == (
-                    batch_size,
-                    seq_len,
-                ), f"query_mask shape {query_mask.shape} does not match expected {(batch_size, seq_len)}"
-                qm = query_mask.bool().view(batch_size, 1, seq_len, 1)
-            else:
-                qm = None
-            if key_mask is not None:
-                assert key_mask.shape == (
-                    batch_size,
-                    cross_seq_len,
-                ), f"key_mask shape {key_mask.shape} does not match expected {(batch_size, cross_seq_len)}"
-                km = key_mask.bool().view(batch_size, 1, 1, cross_seq_len)
-            else:
-                km = None
-            if qm is not None and km is not None:
-                mask_4d = qm & km  # (B, 1, S, 1) & (B, 1, 1, S_cross) -> (B, 1, S, S_cross)
-            elif qm is not None:
-                mask_4d = qm  # (B, 1, S, 1) -> (B, 1, S, S_cross)
-            else:
-                mask_4d = km  # (B, 1, 1, S_cross) -> (B, 1, S, S_cross)
-            scores = scores.masked_fill(mask_4d == 0, float("-inf"))
+        if mask2d is not None:
+            # (B, S, S_cross) -> (B, 1, S, S_cross) -> broadcast to (B, H, S, S_cross)
+            assert mask2d.shape == (
+                batch_size,
+                seq_len,
+                cross_seq_len,
+            ), f"Mask shape {mask2d.shape} does not match expected {(batch_size, seq_len, cross_seq_len)}"
+            scores = scores.masked_fill(mask2d.unsqueeze(1), float("-inf"))
 
         # 3. Softmax to get attention weights
         attn = F.softmax(scores, dim=-1)

@@ -57,12 +57,11 @@ class CrossTransformerBlock(nn.Module):
         self,
         hidden_input: torch.Tensor,
         cross_input: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        cross_mask: Optional[torch.Tensor] = None,
+        mask2d: Optional[torch.Tensor] = None,
     ):
         norm_hidden_states = self.norm1(hidden_input)
         norm_hidden_states_pos = self.pos_embed(norm_hidden_states)
-        attention_output = self.cross_attention(norm_hidden_states_pos, cross_input, query_mask=attention_mask, key_mask=cross_mask)
+        attention_output = self.cross_attention(norm_hidden_states_pos, cross_input, mask2d=mask2d)
         attention_output = self.final_dropout(attention_output)
         if self.final_dropout:
             attention_output = self.dropout(attention_output)

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Optional
+from class_free_guide.network.base.mlp import MLP
 from .flow_cfg import FlowInfo, FlowMatchingCfg, FlowNoiseType
 from class_free_guide.network.nosise_gen.log_noise_nn import LogNoiseNN
 from class_free_guide.algorithm.log_prob import get_logprob_norm
@@ -20,6 +21,8 @@ class FlowMatcherBase(nn.Module):
         if model is not None:
             self.model = model
             self.model.to(self.cfg.device)
+        else:
+            self.model = MLP(cfg.hidden_dim, cfg.hidden_dim, [256, 256, 256])
         assert self.cfg.num_sample_steps > 0, "num_sample_steps must be greater than 0"
         assert self.cfg.real_denoise_step > 0, "real_denoise_step must be greater than 0"
         assert self.cfg.num_sample_steps >= self.cfg.real_denoise_step, "num_sample_steps must be greater than or equal to real_denoise_step"
@@ -32,6 +35,9 @@ class FlowMatcherBase(nn.Module):
         if self.cfg.noise_inference == FlowNoiseType.REINFLOW:
             self.log_noise_nn = LogNoiseNN(self.cfg.hidden_dim, self.cfg.output_dim, self.cfg.noise_hidden_dim, self.cfg.noise_activation)
             self.log_noise_nn.to(self.cfg.device)
+        elif self.cfg.noise_inference == FlowNoiseType.SDE:
+            self.alpha = self.cfg.alpha
+        self.device = self.cfg.device
         self.to(self.cfg.device)
 
     def forward(
@@ -58,9 +64,9 @@ class FlowMatcherBase(nn.Module):
     def sample_noise_action(
         self,
         x_t: torch.Tensor,
-        condition: Optional[torch.Tensor],
         time_idx: int,
         inject_noise: bool,
+        condition: Optional[torch.Tensor] = None,
     ):
         """
         Sample once noise std and action mean
@@ -101,7 +107,7 @@ class FlowMatcherBase(nn.Module):
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
         return x_t_mean, x_t_std, t_input, v_t
 
-    def train_floward(self, input: torch.Tensor, condition: Optional[torch.Tensor] = None) -> BatchFeature:
+    def train_forward(self, input: torch.Tensor, condition: Optional[torch.Tensor] = None) -> BatchFeature:
         x_t = input  # x0
         time_stamp = []
         chain = [x_t]
@@ -110,9 +116,9 @@ class FlowMatcherBase(nn.Module):
         for i in range(self.cfg.num_sample_steps):
             x_t_mean, x_t_std, t_input, v_t = self.sample_noise_action(
                 x_t,
-                condition,
                 time_idx=i,
                 inject_noise=self.denoise_flag[i],
+                condition=condition,
             )
             # inject noise
             x_t = x_t_mean + torch.normal(mean=0.0, std=1.0, size=x_t_mean.shape, dtype=torch.float32, device=self.cfg.device) * x_t_std
@@ -156,9 +162,8 @@ class FlowMatcherBase(nn.Module):
             state_noise_std = self.log_noise_nn(model_output)  # (batch_size, action_dim)
             dict_["state_noise_std"] = state_noise_std
         elif noise_type == FlowNoiseType.SDE:
-            alpha = self.cfg.alpha
             t = torch.where(t_input == 0, self.timesteps[num_step + 1], self.timesteps[num_step])
-            sigma = alpha * torch.sqrt((1 - t) / t)
+            sigma = self.alpha * torch.sqrt((1 - t) / t)
             # std=sqrt(dt)*sigma
             dict_["sigma"] = sigma
             dict_["state_noise_std"] = torch.sqrt(delta) * sigma
@@ -175,10 +180,11 @@ class FlowMatcherBase(nn.Module):
         Calculate the conditional flow matching loss.
 
         Args:
-            state_head: [B, N, D_s] State head
-            x1: [B, N, D_a] Final denoised action
-            eps: [B, N, D_a] Sampled noise
-            t: [B, N, 1] Time step
+            data: BatchFeature containing the training data, which should include:
+                - "chain": [B, num_sample_steps+1, action_dim] the chain of noised actions at each time step
+                - "chain_v": [B, num_sample_steps+1, action_dim] the predicted velocity at each time step
+                - "time_stamp": [B, num_sample_steps+1, 1] the time stamp for each time step
+            x_ref: [B, action_dim] the reference action (x0) for calculating the loss
 
         Returns:
             loss: [B] Loss for each sample in the batch

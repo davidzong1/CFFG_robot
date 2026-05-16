@@ -57,18 +57,14 @@ class CondInjectCrossTransformerBlock(nn.Module):
             bias=ff_bias,
             inner_dim=ff_inner_dim,
         )
-        self.feed_out_scale = (
-            ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, activate=activate, use_shift=False) if use_feed_out_scale else nn.Identity()
-        )
+        self.feed_out_scale = ScaleShift(hidden_dim=hidden_dim, cond_dim=condition_dim, use_shift=False) if use_feed_out_scale else nn.Identity()
         self.dropout = nn.Dropout(dropout) if final_dropout else nn.Identity()
 
     def forward(
         self,
         hidden_input: torch.Tensor,
-        cross_input: torch.Tensor,
         condition_input: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        cross_mask: Optional[torch.Tensor] = None,
+        mask2d: Optional[torch.Tensor] = None,
     ):
         norm_cross_hidden_states = self.norm_cross(hidden_input)
         norm_condition_input = self.norm_condition(condition_input)
@@ -78,8 +74,7 @@ class CondInjectCrossTransformerBlock(nn.Module):
         cross_attention_output = self.crossattentionblock(
             hidden_input=norm_cross_hidden_states_pos,
             cross_input=norm_condition_input,
-            query_mask=attention_mask,
-            key_mask=cross_mask,
+            mask2d=mask2d,
         )
         # dropout after attention
         cross_attention_output = self.dropout(cross_attention_output)

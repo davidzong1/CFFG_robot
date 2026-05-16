@@ -28,7 +28,7 @@ class MLP(nn.Sequential):
         self,
         input_dim: int,
         output_dim: int | tuple[int] | list[int],
-        hidden_dims: tuple[int] | list[int],
+        hidden_dims: tuple[int] | list[int] = [],
         activation: str = "elu",
         activation_kwargs: dict | None = None,
         last_activation: str | None = None,
@@ -49,25 +49,8 @@ class MLP(nn.Sequential):
         self.activation = activation
         # Create layers sequentially
         layers = []
-        layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
-        # Resolve activation functions
-        activation_mod = resolve_nn_activation(activation)
-        if activation_mod is None:
-            if activation_kwargs is None:
-                activation_mod = resolve_activate_expand(activation, hidden_dims_processed[layer_index + 1], hidden_dims_processed[layer_index + 1])
-            else:
-                activation_mod = resolve_activate_expand(
-                    activation,
-                    hidden_dims_processed[layer_index + 1],
-                    hidden_dims_processed[layer_index + 1],
-                    **activation_kwargs,
-                )
-            if activation_mod is None:
-                raise ValueError(f"Invalid activation function '{activation}'. Valid activations are: {list(resolve_nn_activation('').keys())}")
-        layers.append(activation_mod)
-
-        for layer_index in range(len(hidden_dims_processed) - 1):
-            layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
+        if len(hidden_dims) > 0:
+            layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
             # Resolve activation functions
             activation_mod = resolve_nn_activation(activation)
             if activation_mod is None:
@@ -86,35 +69,60 @@ class MLP(nn.Sequential):
                     raise ValueError(f"Invalid activation function '{activation}'. Valid activations are: {list(resolve_nn_activation('').keys())}")
             layers.append(activation_mod)
 
-        # Add last layer
-        if isinstance(output_dim, int):
-            layers.append(nn.Linear(hidden_dims_processed[-1], output_dim))
-        else:
-            # Compute the total output dimension
-            total_out_dim = reduce(lambda x, y: x * y, output_dim)
-            # Add a layer to reshape the output to the desired shape
-            layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
-            layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
+            for layer_index in range(len(hidden_dims_processed) - 1):
+                layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
+                # Resolve activation functions
+                activation_mod = resolve_nn_activation(activation)
+                if activation_mod is None:
+                    if activation_kwargs is None:
+                        activation_mod = resolve_activate_expand(
+                            activation, hidden_dims_processed[layer_index + 1], hidden_dims_processed[layer_index + 1]
+                        )
+                    else:
+                        activation_mod = resolve_activate_expand(
+                            activation,
+                            hidden_dims_processed[layer_index + 1],
+                            hidden_dims_processed[layer_index + 1],
+                            **activation_kwargs,
+                        )
+                    if activation_mod is None:
+                        raise ValueError(
+                            f"Invalid activation function '{activation}'. Valid activations are: {list(resolve_nn_activation('').keys())}"
+                        )
+                layers.append(activation_mod)
 
-        # Add last activation function if specified
-        last_activation_mod = resolve_nn_activation(last_activation) if last_activation is not None else None
-        if (last_activation_mod is None) and (last_activation is not None):
-            if activation_kwargs is None:
-                last_activation_mod = resolve_activate_expand(
-                    last_activation, hidden_dims_processed[layer_index + 1], hidden_dims_processed[layer_index + 1]
-                )
+            # Add last layer
+            if isinstance(output_dim, int):
+                layers.append(nn.Linear(hidden_dims_processed[-1], output_dim))
             else:
-                last_activation_mod = resolve_activate_expand(
-                    last_activation,
-                    hidden_dims_processed[layer_index + 1],
-                    hidden_dims_processed[layer_index + 1],
-                    **activation_kwargs,
-                )
-            if last_activation_mod is None:
-                raise ValueError(f"Invalid activation function '{last_activation}'. Valid activations are: {list(resolve_nn_activation('').keys())}")
-        if last_activation is not None:
-            layers.append(last_activation_mod)
+                # Compute the total output dimension
+                total_out_dim = reduce(lambda x, y: x * y, output_dim)
+                # Add a layer to reshape the output to the desired shape
+                layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
+                layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
 
+            # Add last activation function if specified
+            last_activation_mod = resolve_nn_activation(last_activation) if last_activation is not None else None
+            if (last_activation_mod is None) and (last_activation is not None):
+                if activation_kwargs is None:
+                    last_activation_mod = resolve_activate_expand(
+                        last_activation, hidden_dims_processed[layer_index + 1], hidden_dims_processed[layer_index + 1]
+                    )
+                else:
+                    last_activation_mod = resolve_activate_expand(
+                        last_activation,
+                        hidden_dims_processed[layer_index + 1],
+                        hidden_dims_processed[layer_index + 1],
+                        **activation_kwargs,
+                    )
+                if last_activation_mod is None:
+                    raise ValueError(
+                        f"Invalid activation function '{last_activation}'. Valid activations are: {list(resolve_nn_activation('').keys())}"
+                    )
+            if last_activation is not None:
+                layers.append(last_activation_mod)
+        else:
+            layers.append(nn.Linear(input_dim, output_dim))
         # Register the layers
         for idx, layer in enumerate(layers):
             self.add_module(f"{idx}", layer)
@@ -132,13 +140,9 @@ class MLP(nn.Sequential):
 
     def forward(self, x: torch.Tensor, res: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass of the MLP."""
-        if res is not None:
-            for layer in self:
-                x = layer(x) + res
-        else:
-            for layer in self:
-                x = layer(x)
-        return x
+        for layer in self:
+            x = layer(x)
+        return x + res if res is not None else x
 
     def frozen_all_layers(self) -> None:
         """Freeze all layers of the MLP."""

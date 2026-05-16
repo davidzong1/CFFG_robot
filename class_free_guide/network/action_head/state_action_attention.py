@@ -1,29 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .utils.rolling_input import RollingInputBuffer
 from class_free_guide.network.base.dit_block.dit_ln_attention import DitBlock
-from class_free_guide.network.base.operator import ScaleShift
 from class_free_guide.network.action_head.utils.utils import TimestepEmbedding, Timesteps
 from typing import Optional
-
-
-class denoise_roller(nn.Module):
-    def __init__(self, roll_n_last, roll_n_future):
-        super().__init__()
-        self.roll_n_last = roll_n_last
-        self.roll_n_future = roll_n_future
-
-    def first_setup(self, x: torch.Tensor):
-        self.last_rolling = RollingInputBuffer(window_size=self.roll_n_last, input_shape=x.shape, device=self.device, type=x.dtype)
-        self.future_rolling = RollingInputBuffer(window_size=self.roll_n_future, input_shape=x.shape, device=self.device, type=x.dtype)
-        self.last_rolling.reset(x)
-
-    def forward(self, x: torch.Tensor):
-        future_noise = torch.rand_like(x)
-        last_rolled, _ = self.last_rolling.roll(x)
-        future_rolled, estimate_now_data = self.future_rolling.roll(future_noise)
-        return last_rolled, future_rolled, estimate_now_data
 
 
 class DenoiserTransformer(nn.Module):
@@ -44,9 +24,9 @@ class DenoiserTransformer(nn.Module):
         self,
         hidden_dim: int,
         condition_dim: int,
-        output_dim: int,
         num_attention_heads: int,
         n_layers: int,
+        output_dim: Optional[int] = None,
         cross_dim: Optional[int] = None,
         condition_hidden_dim: Optional[int | list[int]] = None,
         use_self_cross_attention: bool = False,
@@ -83,7 +63,7 @@ class DenoiserTransformer(nn.Module):
                             DitBlock(
                                 hidden_dim=self.hidden_dim,
                                 condition_dim=self.condition_dim,
-                                condition_hidden_dim=condition_hidden_dim,
+                                condition_mlp_hidden_dim=condition_hidden_dim,
                                 cross_attention_dim=cross_dim,
                                 dropout=dropout if i == n_layers - 1 else 0.0,
                                 num_attention_heads=num_attention_heads,
@@ -98,7 +78,7 @@ class DenoiserTransformer(nn.Module):
                                 use_positional_embedding=use_positional_embedding,
                                 ff_bias=ff_bias,
                                 ff_inner_dim=ff_inner_dim,
-                                attention_bias=attention_bias,
+                                attention_out_bias=attention_bias,
                             )
                         )
                         if i % 2 == 1
@@ -106,7 +86,7 @@ class DenoiserTransformer(nn.Module):
                             DitBlock(
                                 hidden_dim=self.hidden_dim,
                                 condition_dim=self.condition_dim,
-                                condition_hidden_dim=condition_hidden_dim,
+                                condition_mlp_hidden_dim=condition_hidden_dim,
                                 dropout=dropout if i == n_layers - 1 else 0.0,
                                 num_attention_heads=num_attention_heads,
                                 max_token_length=max_token_length,
@@ -120,7 +100,7 @@ class DenoiserTransformer(nn.Module):
                                 use_positional_embedding=use_positional_embedding,
                                 ff_bias=ff_bias,
                                 ff_inner_dim=ff_inner_dim,
-                                attention_bias=attention_bias,
+                                attention_out_bias=attention_bias,
                             )
                         )
                     )
@@ -133,7 +113,7 @@ class DenoiserTransformer(nn.Module):
                     DitBlock(
                         hidden_dim=self.hidden_dim,
                         condition_dim=self.condition_dim,
-                        condition_hidden_dim=condition_hidden_dim,
+                        condition_mlp_hidden_dim=condition_hidden_dim,
                         dropout=dropout if i == n_layers - 1 else 0.0,
                         num_attention_heads=num_attention_heads,
                         max_token_length=max_token_length,
@@ -147,12 +127,12 @@ class DenoiserTransformer(nn.Module):
                         use_positional_embedding=use_positional_embedding,
                         ff_bias=ff_bias,
                         ff_inner_dim=ff_inner_dim,
-                        attention_bias=attention_bias,
+                        attention_out_bias=attention_bias,
                     )
                     for i in range(n_layers)
                 ]
             )
-        self.proj_out = nn.Linear(self.hidden_dim, self.output_dim)
+        self.output_proj = nn.Linear(self.hidden_dim, self.output_dim) if self.output_dim is not None else nn.Identity()
         print(
             "Total number of DiT parameters: ",
             sum(p.numel() for p in self.parameters() if p.requires_grad),
@@ -164,7 +144,7 @@ class DenoiserTransformer(nn.Module):
         if model_forzen:
             for param in self.model.parameters():
                 param.requires_grad = False
-            for param in self.proj_out.parameters():
+            for param in self.output_proj.parameters():
                 param.requires_grad = False
             print("Dit model parameters frozen.")
 
@@ -176,23 +156,18 @@ class DenoiserTransformer(nn.Module):
         hidden_states: torch.Tensor,
         t_idx: torch.Tensor,
         cross_attention_states: Optional[torch.Tensor] = None,
-        self_attention_mask: Optional[torch.Tensor] = None,
-        cross_attention_mask: Optional[torch.Tensor] = None,
+        mask2d: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # timestep embedding
         t_emb = self.timestep_encoder(t_idx)
         # DiT blocks
         for block in self.model:
-            if isinstance(block, DitBlock):
-                hidden_states = block(
-                    hidden_input=hidden_states,
-                    cross_attention_states=cross_attention_states,
-                    condition_input=t_emb,
-                    cross_input=cross_attention_states,
-                    self_attention_mask=self_attention_mask,
-                    cross_attention_mask=cross_attention_mask,
-                )
-            else:
-                hidden_states = block(hidden_states, t_emb)
-        output = self.proj_out(hidden_states)
-        return output
+            hidden_states = block(
+                hidden_input=hidden_states,
+                cross_attention_states=cross_attention_states,
+                condition_input=t_emb,
+                cross_input=cross_attention_states,
+                mask2d=mask2d,
+            )
+        hidden_states = self.output_proj(hidden_states)
+        return hidden_states

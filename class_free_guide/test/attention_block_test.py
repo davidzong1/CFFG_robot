@@ -28,8 +28,8 @@ def test_attention_block_cross_attention_shape_and_mask():
         ],
         dtype=torch.bool,
     )
-
-    out = block(hidden, cross_input=cross, query_mask=query_mask, key_mask=key_mask)
+    mask2d = query_mask.unsqueeze(2) & key_mask.unsqueeze(1)
+    out = block(hidden, cross_input=cross, mask2d=mask2d)
 
     assert out.shape == hidden.shape
     assert torch.isfinite(out).all()

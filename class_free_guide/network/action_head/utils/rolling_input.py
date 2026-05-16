@@ -30,11 +30,20 @@ class RollingInputBuffer(nn.Module):
                 self.batch_size, self.window_size, *self.input_shape_one_batch, dtype=self._buffer.dtype, device=self._buffer.device
             )
 
+    def update_all(self, x: torch.Tensor):
+        cache = self._buffer
+        self._buffer = x.view(self._buffer.shape)
+        return cache
+
+    @property
+    def data(self):
+        return self._buffer
+
     def forward(self, x) -> tuple:
         roll_data = self._buffer[:, 0, ...]  # get the oldest data in the buffer
         self._buffer = torch.roll(self._buffer, shifts=-1, dims=1)
         self._buffer[:, -1, ...] = x
-        return self._buffer, roll_data
+        return roll_data
 
 
 # ===================== Example =====================
@@ -46,7 +55,8 @@ if __name__ == "__main__":
     print(f"input shape: {buffer.batch_size}")
     for i in range(10):
         x = torch.randn(2, 3, 3, device=device, dtype=torch.float32)  # batch_size=2, feature_dim=3
-        output, _ = buffer(x)
+        _ = buffer(x)
+        output = buffer.data
         if i > 0:
             if (cache == output[:, 3, :, :].detach()).all().item():
                 print("Rolling buffer is working correctly.")

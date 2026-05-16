@@ -80,7 +80,7 @@ def train_flow_matching(config: FlowDemoConfig):
 
     for step in range(1, config.train_steps + 1):
         x0, x1 = sample_gaussians(config.batch_size, device)
-        data = flow.train_floward(input=x0)
+        data = flow.train_forward(input=x0)
         loss = flow.compute_cfm_loss(data, x1)
         optimizer.zero_grad()
         loss.backward()

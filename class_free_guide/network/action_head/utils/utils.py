@@ -63,7 +63,7 @@ class TimestepEmbedding(nn.Module):
         self,
         input_dim: int,
         time_embed_dim: int,
-        act_fn: str = "silu",
+        act_fn: str = "swish",
         out_dim: int = None,
         post_act_fn: str | None = None,
         cond_proj_dim=None,

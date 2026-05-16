@@ -35,6 +35,7 @@ class FlowNoiseType:
 @dataclass
 class FlowMatchingCfg:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size: int = field(default=256, metadata={"help": "batch size for flow matching training"})
     num_sample_steps: int = field(default=10, metadata={"help": "number of sampling steps in flow matching"})
     noise_inference: FlowNoiseType = field(
         default=FlowNoiseType.SDE, metadata={"help": "type of noise inference for flow matching, can be 'reinflow' or 'sde'"}
@@ -61,8 +62,6 @@ class FlowControlCfg(FlowMatchingCfg):
     # model parameters
     state_dim: int = field(default=72, metadata={"help": "dimension of state input to flow model"})
     action_dim: int = field(default=29, metadata={"help": "dimension of action output from flow model"})
-    hidden_dim: int = field(default=1024, metadata={"help": "to base_model input dimension"})
-    output_dim: int = field(default=29, metadata={"help": "base_model output dimension"})
     n_layers: int = field(default=3, metadata={"help": "number of layers in the flow model"})
     num_attention_heads: int = field(default=8, metadata={"help": "number of attention heads in the flow model"})
     model_pos_embedding: bool = field(default=True, metadata={"help": "whether to use positional embedding in the flow model"})
@@ -72,12 +71,24 @@ class FlowControlCfg(FlowMatchingCfg):
     model_dropout: float = field(default=0.3, metadata={"help": "dropout rate for the flow model"})
     final_droupout: bool = field(default=True, metadata={"help": "whether to apply dropout to the final output of the flow model"})
     attention_bias: bool = field(default=False, metadata={"help": "whether to use attention bias in the flow model"})
+    # SDE parameters
+    state_alpha: float = field(
+        default=0.5, metadata={"help": "alpha parameter for state noise in SDE noise model, only used when noise_inference is 'sde'"}
+    )
+    action_alpha: float = field(
+        default=0.5, metadata={"help": "alpha parameter for action noise in SDE noise model, only used when noise_inference is 'sde'"}
+    )
     # model fine-tuning
     timer_forzen: bool = field(default=False, metadata={"help": "whether to freeze the time embedding in the flow model"})
     model_forzen: bool = field(default=False, metadata={"help": "whether to freeze the flow model parameters"})
     # roller parameters
-    roller_n_last: int = field(default=2, metadata={"help": "number of last steps to roll for denoising"})
-    roller_n_future: int = field(default=2, metadata={"help": "number of future steps to roll for denoising"})
+    roll_n_last: int = field(default=2, metadata={"help": "number of last steps to roll for denoising"})
+    roll_n_future: int = field(default=2, metadata={"help": "number of future steps to roll for denoising"})
+    # decoder parameters
+    decoder_hidden_dim: list[int] = field(default_factory=lambda: [256, 128], metadata={"help": "hidden dimension for the action decoder"})
+    coder_hidden_dim: list[int] = field(
+        default_factory=lambda: [128, 256], metadata={"help": "hidden dimension for the state and action encoder in the flow model"}
+    )
 
 
 class FlowMultimodalCfg(FlowControlCfg):
