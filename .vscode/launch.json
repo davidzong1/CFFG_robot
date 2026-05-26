@@ -5,11 +5,23 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "rl",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/zwc/anaconda3/envs/cffg/bin/python",
+            "program": "${workspaceFolder}/class_free_guide/pineline/rl/script/train.py",
+            "console": "integratedTerminal",
+            "args": [
+                "Unitree-Go2-Flat",
+                "--env.scene.num-envs=4096"
+            ]
+        },
+        {
             "name": "flow matching test",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/class_free_guide/test/flow_matching_base_test.py",
             "console": "integratedTerminal"
-        }
+        },
     ]
 }

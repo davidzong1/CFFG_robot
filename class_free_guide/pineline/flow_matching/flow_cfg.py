@@ -80,7 +80,7 @@ class FlowControlCfg(FlowMatchingCfg):
     )
     # model fine-tuning
     timer_forzen: bool = field(default=False, metadata={"help": "whether to freeze the time embedding in the flow model"})
-    model_forzen: bool = field(default=False, metadata={"help": "whether to freeze the flow model parameters"})
+    model_forzen: bool = field(default=False, metadata={"help": "whether to fexreeze the flow model parameters"})
     # roller parameters
     roll_n_last: int = field(default=2, metadata={"help": "number of last steps to roll for denoising"})
     roll_n_future: int = field(default=2, metadata={"help": "number of future steps to roll for denoising"})

@@ -33,12 +33,12 @@ class VAE(nn.Module):
             self.decoder = decoder_model
 
     def forward(self, x):
-        """ban the forward method, since we only want to use the encode and decode methods"""
-        raise NotImplementedError("VAE.forward() is disabled; call encoder/decoder directly.")
+        return self.encode_inference(x)
 
     def encode_inference(self, x):
-        z, _, _ = self.encode(x)
-        return z
+        mu_var = self.encoder(x)
+        mu, _ = torch.chunk(mu_var, 2, dim=-1)
+        return mu
 
     def decode_inference(self, z):
         return self.decode(z)

@@ -24,9 +24,7 @@ class FlowControl(FlowMatcherBase):
         self.last_sa_length = cfg.roll_n_last
         self.future_sa_length = cfg.roll_n_future
         self.roller = state_action_denoise_roller(roll_n_last=cfg.roll_n_last, roll_n_future=cfg.roll_n_future)
-        self.self_total_token = (
-            cfg.roll_n_last + cfg.roll_n_future + 1
-        )  # (state+action)*roll_n_last + (state+action)*roll_n_future + current_state_action
+        self.total_token = cfg.roll_n_last + cfg.roll_n_future + 1  # (state+action)*roll_n_last + (state+action)*roll_n_future + current_state_action
         state_encoder = MLP(input_dim=cfg.hidden_dim, output_dim=cfg.state_dim, hidden_dims=cfg.coder_hidden_dim, activation="swish")
         action_encoder = MLP(input_dim=cfg.hidden_dim, output_dim=cfg.action_dim, hidden_dims=cfg.coder_hidden_dim, activation="swish")
         # Since it is only used for motion control itself without utilizing multimodal information, cross-attention is not employed
@@ -53,18 +51,18 @@ class FlowControl(FlowMatcherBase):
         self.action_cache = torch.zeros(self.cfg.batch_size, self.cfg.action_dim, dtype=torch.float32, device=self.cfg.device)
         self._state_action_mask()
         if self.cfg.noise_inference == FlowNoiseType.SDE:
-            self.alpha = torch.ones(1, self.self_total_token * 2, device=self.device)
-            index = torch.arange(self.self_total_token, device=self.device)
+            self.alpha = torch.ones(1, self.total_token * 2, device=self.device)
+            index = torch.arange(self.total_token, device=self.device)
             state_k = index - self.cfg.roll_n_last
-            state_den = self.self_total_token - self.cfg.roll_n_last - 1
+            state_den = self.total_token - self.cfg.roll_n_last - 1
             state_ramp = self.cfg.state_alpha * torch.sin((state_k / state_den) * math.pi / 2)
             state_index = torch.where(state_k <= 0, torch.zeros_like(state_k, dtype=torch.float32), state_ramp)
             action_k = index + 1 - self.cfg.roll_n_last
-            action_den = self.self_total_token - self.cfg.roll_n_last
+            action_den = self.total_token - self.cfg.roll_n_last
             action_ramp = self.cfg.action_alpha * torch.sin((action_k / action_den) * math.pi / 2)
             action_index = torch.where(action_k <= 0, torch.zeros_like(action_k, dtype=torch.float32), action_ramp)
-            self.alpha[:, : self.self_total_token] = state_index
-            self.alpha[:, self.self_total_token :] = action_index
+            self.alpha[:, : self.total_token] = state_index
+            self.alpha[:, self.total_token :] = action_index
         else:
             raise ValueError(f"Unknown noise method: {self.cfg.noise_inference}, only 'sde' is supported for now.")
 
@@ -84,14 +82,14 @@ class FlowControl(FlowMatcherBase):
         .:s,s,...,a,a,...\n
         """
         # [1,squence_length, squence_length]
-        self.mask_2d = torch.zeros(1, 2 * self.self_total_token, 2 * self.self_total_token, dtype=torch.bool, device=self.device)
+        self.mask_2d = torch.zeros(1, 2 * self.total_token, 2 * self.total_token, dtype=torch.bool, device=self.device)
         # state mask
-        n = self.self_total_token
+        n = self.total_token
         idx = torch.arange(n, device=self.device)
         mask = idx[None, :] >= idx[:, None]  # [n, n] 上三角含对角
         self.mask_2d[0, :n, :n] = mask
         # action mask
-        n = self.self_total_token
+        n = self.total_token
         offset = n  # 你想偏移的行数
         idx = torch.arange(n, device=self.device)
         mask = idx[:, None] >= (idx[None, :])  # [n, n] 下三角不含对角
@@ -149,10 +147,36 @@ class FlowControl(FlowMatcherBase):
             "train_forward is not implemented for FlowControl, please use the train_forward function in FlowMatcherBase or implement your own train_forward function in FlowControl if you want to use the noise inference and roller mechanism in FlowControl."
         )
 
-    def flow_train(self, state: torch.Tensor, action: torch.Tensor, guidance_condition: Optional[torch.Tensor] = None):
-        state_input, action_input = self.roller(state, action)
-        state_hidden = self.state_vae.encode_inference(state_input)
-        action_hidden = self.action_vae.encode_inference(action_input)
+    def rolling_schedule(self, state: torch.Tensor, action: torch.Tensor):
+        """
+        Update the rolling buffer with the new state and action, and get the rolled state and action for model input.
+        Args:
+            state: [B, state_dim] current state
+            action: [B, action_dim] current action
+        Returns:
+            rolled_state: [B, roll_n_last+roll_n_future+1, state_dim] rolled state for model input
+            rolled_action: [B, roll_n_last+roll_n_future+1, action_dim] rolled action for model input
+        """
+        rolled_state, rolled_action = self.roller(state, action)
+        return rolled_state, rolled_action
+
+    def encoder_forward(self, state: torch.Tensor, action: torch.Tensor):
+        """
+        Encode the state and action into latent space using VAE, and then concatenate the latent state and action for model input.
+        Args:
+            state: [B, state_dim] current state
+            action: [B, action_dim] current action
+        Returns:
+            state_latent: [B, latent_dim] latent state
+            action_latent: [B, latent_dim] latent action
+            model_input: [B, roll_n_last+roll_n_future+1, hidden_dim] concatenated latent state and action for model input
+        """
+        state_latent = self.state_vae(state)
+        action_latent = self.action_vae(action)
+        model_input = torch.cat([state_latent, action_latent], dim=-1)  # [B, hidden_dim]
+        return state_latent, action_latent, model_input
+
+    def flow_forward(self, state_hidden: torch.Tensor, action_hidden: torch.Tensor, guidance_condition: Optional[torch.Tensor] = None):
         x_t = torch.cat([state_hidden, action_hidden], dim=1)  # Token cat [B,t_s+ta,D_h]
         x_t = x_t.contiguous()
         time_stamp = []
@@ -188,6 +212,24 @@ class FlowControl(FlowMatcherBase):
             }
         )
 
+    def decode_forward(self, x1: torch.Tensor):
+        """
+        Decode the noised action x1 to get the predicted clean action.
+        Args:
+            x1: [B, roll_n_last+roll_n_future+1, hidden_dim] the noised action at the last time step of the sampling process
+        Returns:
+            state_pred: [B, state_dim] the predicted clean state
+            action_pred: [B, action_dim] the predicted clean action
+        """
+        state_hidden = x1[:, : self.total_token, :]  # [B, total_token, hidden_dim]
+        action_hidden = x1[:, self.total_token :, :]  # [B, total_token, hidden_dim]
+        state_pred = self.state_vae.decode(state_hidden)  # [B, total_token, state_dim]
+        action_pred = self.action_vae.decode(action_hidden)  # [B, total_token, action_dim]
+        return state_pred[:, -1, :], action_pred[:, -1, :]
+
+    ##########################################################################
+    # Flow Model Loss
+    ##########################################################################
     def compute_cfm_loss(
         self,
         data: BatchFeature,
@@ -221,14 +263,19 @@ class FlowControl(FlowMatcherBase):
         This can be used to ensure that the latent space of the VAE captures the essential information of the state and action,
         which can help improve the performance of the flow model.
         """
-        state_latent, state_mu, state_log_var = self.state_vae.encode(state)
-        action_latent, action_mu, action_log_var = self.action_vae.encode(action)
+        state_cache = state.detach()  # Detach the state tensor to prevent gradients from flowing back to the original state during VAE training
+        action_cache = action.detach()  # Detach the action tensor to prevent gradients from flowing back to the original action during VAE training
+        state_latent, state_mu, state_log_var = self.state_vae.encode(state_cache)
+        action_latent, action_mu, action_log_var = self.action_vae.encode(action_cache)
         state_recon = self.state_vae.decode(state_latent)
         action_recon = self.action_vae.decode(action_latent)
         state_decoder_loss = self.state_vae.cal_vae_loss(state_recon, state, state_mu, state_log_var)
         action_decoder_loss = self.action_vae.cal_vae_loss(action_recon, action, action_mu, action_log_var)
         return state_decoder_loss, action_decoder_loss
 
+    ##########################################################################
+    # VAE Loss
+    ##########################################################################
     def compute_last_state_action_consistency_loss(
         self,
         data: BatchFeature,
@@ -236,9 +283,8 @@ class FlowControl(FlowMatcherBase):
         action_ref: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate the consistency loss between the last state and action in the chain and the reference state and action."""
-        last_x = data["x1_prev"][:, : self.last_sa_length, :]  # [B, last_sa_length, D_s]
-        last_state_pred = last_x[:, : self.cfg.state_dim]  # [B, D_s]
-        last_action_pred = last_x[:, self.cfg.state_dim :]  # [B, D_a]
+        last_state_pred = data["x1_prev"][:, : self.last_sa_length, :]  # [B, last_sa_length, D_s]
+        last_action_pred = data["x1_prev"][:, self.total_token : self.total_token + self.last_sa_length, :]  # [B, last_sa_length,D_a]
         state_loss = F.mse_loss(last_state_pred, state_ref, reduction="mean")
         action_loss = F.mse_loss(last_action_pred, action_ref, reduction="mean")
         return state_loss + action_loss

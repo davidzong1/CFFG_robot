@@ -6,6 +6,10 @@ from .utils.rolling_input import RollingInputBuffer
 
 
 class state_action_denoise_roller(nn.Module):
+    """
+    structure: [[s_t-N,s_t-N+1,...,s_t,...s_t+N],[a_t-N,a_t-N+1,...,a_t,...a_t+N]]
+    """
+
     def __init__(self, roll_n_last, roll_n_future):
         super().__init__()
         self.roll_n_last = roll_n_last

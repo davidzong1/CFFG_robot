@@ -1,7 +1,13 @@
-numpy
-git-lfs
-diffusers
-torch==2.7.0
-setuptools
-matplotlib
-einops
+# numpy
+# git-lfs
+# diffusers
+# torch==2.7.0
+# setuptools
+# matplotlib
+# einops
+# mujoco
+# mujoco_mjx
+# brax
+# mjlab==1.2.0
+# mjlab
+# mujoco-warp==3.5.0
