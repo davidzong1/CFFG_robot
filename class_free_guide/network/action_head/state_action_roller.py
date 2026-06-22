@@ -21,11 +21,13 @@ class state_action_denoise_roller(nn.Module):
          For example, if roll_n_last=2 and roll_n_future=2, the input
         """
         self.state_last_rolling = RollingInputBuffer(window_size=self.roll_n_last, input_shape=state.shape, device=self.device, type=state.dtype)
-        self.state_future_rolling = RollingInputBuffer(window_size=self.roll_n_future, input_shape=state.shape, device=self.device, type=state.dtype)
         self.action_last_rolling = RollingInputBuffer(window_size=self.roll_n_last, input_shape=action.shape, device=self.device, type=action.dtype)
+        self.state_future_rolling = RollingInputBuffer(window_size=self.roll_n_future, input_shape=state.shape, device=self.device, type=state.dtype)
         self.action_future_rolling = RollingInputBuffer(
             window_size=self.roll_n_future, input_shape=action.shape, device=self.device, type=action.dtype
         )
+        self.denoise_now_state = state.clone()
+        self.denoise_now_action = action.clone()
 
     def get_future_data(self):
         return self.state_future_rolling.data, self.action_future_rolling.data
@@ -33,42 +35,28 @@ class state_action_denoise_roller(nn.Module):
     def get_old_data(self):
         return self.state_last_rolling.data, self.action_last_rolling.data
 
-    def update_all_future_data(self, state_future: torch.Tensor, action_future: torch.Tensor):
-        old_future_state_data = self.state_future_rolling.update_all(state_future)
-        old_future_action_data = self.action_future_rolling.update_all(action_future)
-        return old_future_state_data, old_future_action_data
+    def update_all_future_data(
+        self,
+        denoise_state_future: torch.Tensor,
+        denoise_action_future: torch.Tensor,
+        state_future_noise: torch.Tensor,
+        action_future_noise: torch.Tensor,
+    ):
+        denoise_state_future = torch.roll(denoise_state_future, shifts=-1, dims=1)  # roll to make the most future data at the end
+        denoise_action_future = torch.roll(denoise_action_future, shifts=-1, dims=1)  # roll to make the most future data at the end
+        self.state_future_rolling.update_all(denoise_state_future)
+        self.action_future_rolling.update_all(denoise_action_future)
 
-    def forward(self, now_state: torch.Tensor, now_action: torch.Tensor):
+    def forward(self, now_state: torch.Tensor, now_action: torch.Tensor, denoise_state_future: torch.Tensor, denoise_action_future: torch.Tensor):
+        state_future_noise = torch.empty_like(now_state).uniform_(-1, 1)  # most future noise
+        action_future_noise = torch.empty_like(now_action).uniform_(-1, 1)  # most future noise
+        self.denoise_now_state = denoise_state_future[:, 0:, ...]
+        self.denoise_now_action = denoise_action_future[:, 0:, ...]
+        # update all future data
+        self.update_all_future_data(denoise_state_future, denoise_action_future, state_future_noise, action_future_noise)
+        # update current state and action data
+        _ = self.state_last_rolling(now_state)
+        _ = self.action_last_rolling(now_action)
         sf, af = self.get_future_data()
         sl, al = self.get_old_data()
-        data_state, data_action = torch.cat([sl, now_state.unsqueeze(1), sf], dim=1), torch.cat([al, now_action.unsqueeze(1), af], dim=1)
-        return data_state, data_action
-
-    def update(
-        self,
-        prior_state: torch.Tensor,
-        prior_action: torch.Tensor,
-        state_future: Optional[torch.Tensor] = None,
-        action_future: Optional[torch.Tensor] = None,
-    ):
-        assert (state_future is not None and action_future is not None) or (
-            state_future is None and action_future is None
-        ), "Future state and action data must be coinsistent, either both provided or both None"
-        if state_future is not None:
-            # update all future data
-            state_cache, action_cache = self.update_all_future_data(state_future, action_future)
-            state_cache = state_cache[:, 0, ...]  # get the oldest future state data in the buffer
-            action_cache = action_cache[:, 0, ...]  # get the oldest future action
-            # update current state and action data
-            _ = self.state_last_rolling(prior_state)
-            _ = self.action_last_rolling(prior_action)
-        else:
-            # update newest future data with random noise, and get the oldest future data in the buffer as cache
-            state_future_noise = torch.empty_like(prior_state).uniform_(-1, 1)
-            action_future_noise = torch.empty_like(prior_action).uniform_(-1, 1)
-            state_cache = self.state_future_rolling(state_future_noise)  # get the oldest state data in the buffer
-            action_cache = self.action_future_rolling(action_future_noise)  # get the oldest action data in the buffer
-            # update current state and action data
-            _ = self.state_last_rolling(prior_state)
-            _ = self.action_last_rolling(prior_action)
-        return state_cache, action_cache
+        return torch.cat([sl, self.denoise_now_state, sf], dim=1), torch.cat([al, self.denoise_now_action, af], dim=1)

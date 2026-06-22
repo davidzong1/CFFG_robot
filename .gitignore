@@ -148,3 +148,4 @@ dmypy.json
 logs/**
 wandb/**
 ref_lib/
+.claude/**

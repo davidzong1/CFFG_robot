@@ -20,6 +20,9 @@ class RollingInputBuffer(nn.Module):
         self.input_cat_shape = self.input_shape_one_batch.numel()
         self._buffer = torch.zeros(self.batch_size, self.window_size, *self.input_shape_one_batch, dtype=type, device=device)
 
+    def contiguous(self):
+        self._buffer = self._buffer.contiguous()
+
     def reset(self, x: Optional[torch.Tensor] = None):
         if x is not None:
             self.batch_size = x.shape[0]
@@ -31,9 +34,12 @@ class RollingInputBuffer(nn.Module):
             )
 
     def update_all(self, x: torch.Tensor):
-        cache = self._buffer
+        """Update the entire buffer with new data.
+        Args:
+            x: New data to fill the buffer, shape should be (batch_size, *input_shape_one_batch)
+            Returns:
+            new"""
         self._buffer = x.view(self._buffer.shape)
-        return cache
 
     @property
     def data(self):
@@ -43,6 +49,7 @@ class RollingInputBuffer(nn.Module):
         roll_data = self._buffer[:, 0, ...]  # get the oldest data in the buffer
         self._buffer = torch.roll(self._buffer, shifts=-1, dims=1)
         self._buffer[:, -1, ...] = x
+        self._buffer = self._buffer
         return roll_data
 
 

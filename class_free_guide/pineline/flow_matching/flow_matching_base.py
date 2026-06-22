@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Optional
 from class_free_guide.network.base.mlp import MLP
-from .flow_cfg import FlowInfo, FlowMatchingCfg, FlowNoiseType
+from .flow_cfg import FlowMatchingCfg, FlowNoiseType
 from class_free_guide.network.nosise_gen.log_noise_nn import LogNoiseNN
 from class_free_guide.algorithm.log_prob import get_logprob_norm
 
@@ -24,12 +24,12 @@ class FlowMatcherBase(nn.Module):
         else:
             self.model = MLP(cfg.hidden_dim, cfg.hidden_dim, [256, 256, 256])
         assert self.cfg.num_sample_steps > 0, "num_sample_steps must be greater than 0"
-        assert self.cfg.real_denoise_step > 0, "real_denoise_step must be greater than 0"
-        assert self.cfg.num_sample_steps >= self.cfg.real_denoise_step, "num_sample_steps must be greater than or equal to real_denoise_step"
+        assert self.cfg.num_denoise_steps > 0, "num_denoise_steps must be greater than 0"
+        assert self.cfg.num_sample_steps >= self.cfg.num_denoise_steps, "num_sample_steps must be greater than or equal to num_denoise_steps"
         # time t+1 use in delta
         self.timesteps = torch.linspace(0, 1, self.cfg.num_sample_steps + 1, device=self.cfg.device, dtype=torch.float32)
         self.denoise_flag = torch.zeros(self.cfg.num_sample_steps, dtype=torch.bool, device=self.cfg.device)
-        for i in range(self.cfg.real_denoise_step):
+        for i in range(self.cfg.num_denoise_steps):
             self.denoise_flag[i] = True
         # noise type
         if self.cfg.noise_inference == FlowNoiseType.REINFLOW:
@@ -37,6 +37,8 @@ class FlowMatcherBase(nn.Module):
             self.log_noise_nn.to(self.cfg.device)
         elif self.cfg.noise_inference == FlowNoiseType.SDE:
             self.alpha = self.cfg.alpha
+        elif self.cfg.noise_inference == FlowNoiseType.NONE:
+            pass
         self.device = self.cfg.device
         self.to(self.cfg.device)
 

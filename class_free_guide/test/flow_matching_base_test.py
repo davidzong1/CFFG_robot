@@ -45,7 +45,7 @@ class FlowDemoConfig:
         self.cfg.hidden_dim = 3
         self.cfg.output_dim = 2
         self.cfg.noise_inference = "sde"
-        self.cfg.real_denoise_step = 6
+        self.cfg.num_denoise_steps = 6
         self.cfg.num_sample_steps = 10
         self.device = self.cfg.device
 

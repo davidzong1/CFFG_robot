@@ -4,7 +4,7 @@ from torch import nn
 from typing import Optional
 from torch.distributions import Normal
 from class_free_guide.pineline.flow_matching.flow_matching_base import FlowMatcherBase
-from class_free_guide.pineline.flow_matching.flow_cfg import FlowControlCfg, FlowNoiseType, FlowInfo
+from class_free_guide.pineline.flow_matching.flow_cfg import FlowControlCfg, FlowNoiseType
 from class_free_guide.network.action_head.state_action_attention import DenoiserTransformer
 from class_free_guide.network.action_head.state_action_roller import state_action_denoise_roller
 from class_free_guide.network.base.mlp import MLP
@@ -18,7 +18,7 @@ except ImportError:
     from collections import UserDict as BatchFeature
 
 
-class FlowControl(FlowMatcherBase):
+class FlowControlDIT(FlowMatcherBase):
     def __init__(self, cfg: FlowControlCfg, model: Optional[nn.Module] = None):
         super().__init__(model=model, cfg=cfg)
         self.last_sa_length = cfg.roll_n_last
@@ -63,11 +63,85 @@ class FlowControl(FlowMatcherBase):
             action_index = torch.where(action_k <= 0, torch.zeros_like(action_k, dtype=torch.float32), action_ramp)
             self.alpha[:, : self.total_token] = state_index
             self.alpha[:, self.total_token :] = action_index
+        elif self.cfg.noise_inference == FlowNoiseType.NONE:
+            pass
         else:
             raise ValueError(f"Unknown noise method: {self.cfg.noise_inference}, only 'sde' is supported for now.")
-
+        self._encoder_forward_impl = torch.compile(self._encoder_forward_impl, mode="default")
+        self._decode_forward_impl = torch.compile(self._decode_forward_impl, mode="default")
+        self._flow_forward_impl = torch.compile(self._flow_forward_impl, mode="default")
         print("mask_2d shape:", self.mask_2d.shape)
         print("mask_2d:map\n", self.mask_2d[0, :, :])
+        self._benchmark_inference()
+
+    @torch.no_grad()
+    def _benchmark_inference(self, n_warmup: int = 30, n_iters: int = 100, batch_size: int = 1):
+        """Measure inference latency of _flow_forward_impl on the current CUDA device,
+        then extrapolate to AGX Orin / RTX 4060 / RTX 4090 by FP32 TFLOPS ratio.
+
+        Caveats:
+          - Model is small (L=2*total_token, n_layers=3); on consumer GPUs the kernel
+            launch overhead usually dominates, so TFLOPS-scaling is only an upper bound.
+          - Real numbers on the target GPU should still be measured directly.
+        """
+        device = self.cfg.device
+        if not (isinstance(device, torch.device) and device.type == "cuda") or not torch.cuda.is_available():
+            print("[FlowControlDIT Benchmark] CUDA not available, skip benchmark.")
+            return
+        # Approximate FP32 TFLOPS (vendor specs)
+        gpu_tflops = {
+            "AGX Orin": 5.3,  # 1792-core Ampere @ 1.3 GHz
+            "RTX 4060": 15.1,  # AD107
+            "RTX 4090": 82.6,  # AD102
+        }
+        current_name = torch.cuda.get_device_name(device)
+        baseline_tflops = None
+        baseline_label = None
+        for label, tf in gpu_tflops.items():
+            key = label.split()[-1].lower()  # "orin" / "4060" / "4090"
+            if key in current_name.lower():
+                baseline_tflops, baseline_label = tf, label
+                break
+        if baseline_tflops is None:
+            baseline_tflops = gpu_tflops["RTX 4090"]
+            baseline_label = f"unknown -> RTX 4090 ({baseline_tflops} TF)"
+
+        try:
+            state_hidden = torch.randn(batch_size, self.total_token, self.cfg.hidden_dim, device=device)
+            action_hidden = torch.randn(batch_size, self.total_token, self.cfg.hidden_dim, device=device)
+            self.eval()
+            # warmup (also triggers torch.compile / cuDNN autotune)
+            for _ in range(n_warmup):
+                self._flow_forward_impl(state_hidden, action_hidden)
+            torch.cuda.synchronize(device)
+            starter = torch.cuda.Event(enable_timing=True)
+            ender = torch.cuda.Event(enable_timing=True)
+            starter.record()
+            for _ in range(n_iters):
+                self._flow_forward_impl(state_hidden, action_hidden)
+            ender.record()
+            torch.cuda.synchronize(device)
+            elapsed_ms = starter.elapsed_time(ender) / n_iters
+        except Exception as e:
+            print(f"[FlowControlDIT Benchmark] failed: {e}")
+            return
+
+        cfg = self.cfg
+        print("=" * 72)
+        print(f"[FlowControlDIT Benchmark]  measured GPU: {current_name}  ({baseline_label})")
+        print(
+            f"  batch={batch_size}, total_token={self.total_token}, hidden_dim={cfg.hidden_dim}, "
+            f"n_layers={cfg.n_layers}, num_sample_steps={cfg.num_sample_steps}"
+        )
+        print(f"  measured _flow_forward_impl latency: {elapsed_ms:.3f} ms / call")
+        print(f"  ---- estimated latency on target GPUs (FP32 TFLOPS scaling, upper bound) ----")
+        for label, tf in gpu_tflops.items():
+            est = elapsed_ms * (baseline_tflops / tf)
+            tag = "  (measured)" if label == baseline_label else ""
+            print(f"    {label:<10s} ({tf:5.1f} TFLOPS):  ~{est:7.3f} ms{tag}")
+        print("  Note: model is small => kernel-launch bound on desktop GPUs;")
+        print("        real AGX-Orin number is usually closer to (measured * (baseline / orin)).")
+        print("=" * 72)
 
     def _state_action_mask(self):
         """create mask for state and action, where state can attend to both state and action, while action can only attend to state
@@ -96,6 +170,9 @@ class FlowControl(FlowMatcherBase):
         self.mask_2d[0, n : n + offset, :n] = mask
         self.mask_2d[0, n : n + offset, n : n + offset] = mask
         pass
+
+    def init_roller(self, state: torch.Tensor, action: torch.Tensor):
+        self.roller.first_setup(state, action)
 
     def sample_noise_action(
         self,
@@ -160,7 +237,7 @@ class FlowControl(FlowMatcherBase):
         rolled_state, rolled_action = self.roller(state, action)
         return rolled_state, rolled_action
 
-    def encoder_forward(self, state: torch.Tensor, action: torch.Tensor):
+    def _encoder_forward_impl(self, state: torch.Tensor, action: torch.Tensor):
         """
         Encode the state and action into latent space using VAE, and then concatenate the latent state and action for model input.
         Args:
@@ -176,43 +253,55 @@ class FlowControl(FlowMatcherBase):
         model_input = torch.cat([state_latent, action_latent], dim=-1)  # [B, hidden_dim]
         return state_latent, action_latent, model_input
 
-    def flow_forward(self, state_hidden: torch.Tensor, action_hidden: torch.Tensor, guidance_condition: Optional[torch.Tensor] = None):
-        x_t = torch.cat([state_hidden, action_hidden], dim=1)  # Token cat [B,t_s+ta,D_h]
-        x_t = x_t.contiguous()
-        time_stamp = []
-        chain = [x_t]
-        chain_v = []
-        log_probs = []
-        for i in range(self.cfg.num_sample_steps):
-            x_t_mean, x_t_std, t_input, v_t = self.sample_noise_action(
-                x_t,
-                time_idx=i,
-                inject_noise=self.denoise_flag[i],
-            )
-            # inject noise
-            x_t = x_t_mean + torch.normal(mean=0.0, std=1.0, size=x_t_mean.shape, dtype=torch.float32, device=self.cfg.device) * x_t_std
-            # log
-            time_stamp.append(t_input)
-            chain.append(x_t)
-            chain_v.append(v_t)
-            log_probs.append(get_logprob_norm(sample=x_t, mu=x_t_mean, sigma=x_t_std))
-        x1 = x_t
-        chain = torch.stack(chain, dim=1)  # [B, num_sample_steps+1, action_dim]
-        chain_v = torch.stack(chain_v, dim=1)  # [B, num_sample_steps+1, action_dim]
-        log_probs = torch.stack(log_probs, dim=1)
-        time_stamp = torch.stack(time_stamp, dim=1)
-        return BatchFeature(
-            data={
-                "x0": input,
-                "x1_prev": x1,
-                "chain": chain,
-                "chain_v": chain_v,
-                "log_probs": log_probs,
-                "time_stamp": time_stamp,
-            }
-        )
+    def _flow_forward_impl(
+        self,
+        state_hidden: torch.Tensor,
+        action_hidden: torch.Tensor,
+        guidance_condition: Optional[torch.Tensor] = None,
+    ):
+        if self.cfg.train_model:
+            x_t = torch.cat([state_hidden, action_hidden], dim=1)  # Token cat [B,t_s+ta,D_h]
+            x_t = x_t.contiguous()
+            num_steps = self.cfg.num_sample_steps
+            batch_size = x_t.shape[0]
+            token_shape = x_t.shape[1:]
+            chain = torch.empty((batch_size, num_steps + 1, *token_shape), device=x_t.device, dtype=x_t.dtype)
+            chain[:, 0] = x_t
+            chain_v = torch.empty((batch_size, num_steps, *token_shape), device=x_t.device, dtype=x_t.dtype)
+            log_probs = torch.empty((batch_size, num_steps, *token_shape), device=x_t.device, dtype=x_t.dtype)
+            time_stamp = torch.empty((batch_size, num_steps, 1, 1), device=x_t.device, dtype=x_t.dtype)
+            for i in range(num_steps):
+                x_t_mean, x_t_std, t_input, v_t = self.sample_noise_action(
+                    x_t,
+                    time_idx=i,
+                    inject_noise=self.denoise_flag[i],
+                )
+                # inject noise
+                x_t = x_t_mean + torch.normal(mean=0.0, std=1.0, size=x_t_mean.shape, dtype=torch.float32, device=self.cfg.device) * x_t_std
+                # log
+                time_stamp[:, i] = t_input
+                chain[:, i + 1] = x_t
+                chain_v[:, i] = v_t
+                log_probs[:, i] = get_logprob_norm(sample=x_t, mu=x_t_mean, sigma=x_t_std)
+            x1 = x_t
+            return x1, chain, chain_v, log_probs, time_stamp
+        else:
+            x_t = torch.cat([state_hidden, action_hidden], dim=1)  # Token cat [B,t_s+ta,D_h]
+            x_t = x_t.contiguous()
+            num_steps = self.cfg.num_sample_steps
+            batch_size = x_t.shape[0]
+            token_shape = x_t.shape[1:]
+            for i in range(num_steps):
+                x_t_mean, x_t_std, t_input, v_t = self.sample_noise_action(
+                    x_t,
+                    time_idx=i,
+                    inject_noise=self.denoise_flag[i],
+                )
+                # inject noise
+                x_t = x_t_mean + torch.normal(mean=0.0, std=1.0, size=x_t_mean.shape, dtype=torch.float32, device=self.cfg.device) * x_t_std
+            return x_t, None, None, None, None
 
-    def decode_forward(self, x1: torch.Tensor):
+    def _decode_forward_impl(self, x1: torch.Tensor):
         """
         Decode the noised action x1 to get the predicted clean action.
         Args:
@@ -227,6 +316,27 @@ class FlowControl(FlowMatcherBase):
         action_pred = self.action_vae.decode(action_hidden)  # [B, total_token, action_dim]
         return state_pred[:, -1, :], action_pred[:, -1, :]
 
+    def flow_forward(self, state: torch.Tensor, action: torch.Tensor, guidance_condition: Optional[torch.Tensor] = None):
+        state_hidden, action_hidden, _ = self._encoder_forward_impl(state, action)
+        x1, chain, chain_v, log_probs, time_stamp = self._flow_forward_impl(state_hidden, action_hidden, guidance_condition)
+        state_pred, action_pred = self._decode_forward_impl(x1)
+        if self.cfg.train_model:
+            return BatchFeature(
+                data={
+                    "x0": input,
+                    "x1_prev": x1,
+                    "chain": chain,
+                    "chain_v": chain_v,
+                    "log_probs": log_probs,
+                    "time_stamp": time_stamp,
+                    "state_pred": state_pred,
+                    "action_pred": action_pred,
+                    "action": action_pred[:, self.last_sa_length, :],  # output
+                }
+            )
+        else:
+            return (action_pred[:, self.last_sa_length, :],)  # output
+
     ##########################################################################
     # Flow Model Loss
     ##########################################################################
@@ -236,7 +346,7 @@ class FlowControl(FlowMatcherBase):
         x_ref: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Calculate the conditional flow matching loss.
+        Calculate the standard-conditional flow matching loss.
 
         Args:
             data: BatchFeature containing the training data, which should include:
@@ -257,6 +367,22 @@ class FlowControl(FlowMatcherBase):
         loss_mean = loss.mean(dim=0)
         return loss_mean
 
+    def compute_last_state_action_consistency_loss(
+        self,
+        data: BatchFeature,
+    ) -> torch.Tensor:
+        """Calculate the consistency loss between the last state and action in the chain and the reference state and action."""
+        last_state_pred = data["x1_prev"][:, : self.last_sa_length, :]  # [B, last_sa_length, D_s]
+        last_action_pred = data["x1_prev"][:, self.total_token : self.total_token + self.last_sa_length, :]  # [B, last_sa_length,D_a]
+        state_ref = self.roller.state_last_rolling
+        action_ref = self.roller.action_last_rolling
+        state_loss = F.mse_loss(last_state_pred, state_ref, reduction="mean")
+        action_loss = F.mse_loss(last_action_pred, action_ref, reduction="mean")
+        return state_loss + action_loss
+
+    ##########################################################################
+    # VAE Loss
+    ##########################################################################
     def cal_state_action_encoder_loss(self, state: torch.Tensor, action: torch.Tensor):
         """
         Calculate the VAE reconstruction loss for state and action.
@@ -273,26 +399,10 @@ class FlowControl(FlowMatcherBase):
         action_decoder_loss = self.action_vae.cal_vae_loss(action_recon, action, action_mu, action_log_var)
         return state_decoder_loss, action_decoder_loss
 
-    ##########################################################################
-    # VAE Loss
-    ##########################################################################
-    def compute_last_state_action_consistency_loss(
-        self,
-        data: BatchFeature,
-        state_ref: torch.Tensor,
-        action_ref: torch.Tensor,
-    ) -> torch.Tensor:
-        """Calculate the consistency loss between the last state and action in the chain and the reference state and action."""
-        last_state_pred = data["x1_prev"][:, : self.last_sa_length, :]  # [B, last_sa_length, D_s]
-        last_action_pred = data["x1_prev"][:, self.total_token : self.total_token + self.last_sa_length, :]  # [B, last_sa_length,D_a]
-        state_loss = F.mse_loss(last_state_pred, state_ref, reduction="mean")
-        action_loss = F.mse_loss(last_action_pred, action_ref, reduction="mean")
-        return state_loss + action_loss
-
 
 if __name__ == "__main__":
 
     cfg = FlowControlCfg()
     cfg.action_dim = 1
     cfg.state_dim = 1
-    flow_control = FlowControl(cfg=cfg)
+    flow_control = FlowControlDIT(cfg=cfg)

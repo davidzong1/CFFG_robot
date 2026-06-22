@@ -1,35 +1,12 @@
 from dataclasses import dataclass, field
 import torch
-from enum import Enum
-
-
-class FlowInfo:
-    x_0: torch.Tensor  # (*, action_dim)
-    x_1: torch.Tensor  # (*, action_dim)
-    x_std: torch.Tensor  # (*, num_sample_step, action_dim)
-    x_mean: torch.Tensor  # (*, num_sample_step, action_dim)
-    v_t: torch.Tensor  # (*, num_sample_step, action_dim)
-
-    def __init__(self, x_0, x_1, x_mean, x_std, v_t):
-        self.x_0 = x_0
-        self.x_1 = x_1
-        self.x_std = x_std
-        self.x_mean = x_mean
-        self.v_t = v_t
-
-    def detach(self):
-        self.x_0 = self.x_0.detach()
-        self.x_1 = self.x_1.detach()
-        self.x_std = self.x_std.detach()
-        self.x_mean = self.x_mean.detach()
-        self.v_t = self.v_t.detach()
-        return self
 
 
 @dataclass
 class FlowNoiseType:
     REINFLOW = "reinflow"
     SDE = "sde"
+    NONE = "none"
 
 
 @dataclass
@@ -37,10 +14,10 @@ class FlowMatchingCfg:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size: int = field(default=256, metadata={"help": "batch size for flow matching training"})
     num_sample_steps: int = field(default=10, metadata={"help": "number of sampling steps in flow matching"})
+    num_denoise_steps: int = field(default=10, metadata={"help": "number of denoising steps in flow matching"})
     noise_inference: FlowNoiseType = field(
         default=FlowNoiseType.SDE, metadata={"help": "type of noise inference for flow matching, can be 'reinflow' or 'sde'"}
     )
-    real_denoise_step: int = field(default=10, metadata={"help": "number of sampling steps in flow matching"})
     # SDE parameters
     alpha: float = field(default=0.5, metadata={"help": "alpha parameter for SDE noise model, only used when noise_inference is 'sde'"})
     # Reinflow noise model parameters
@@ -55,6 +32,7 @@ class FlowMatchingCfg:
     # model parameters
     hidden_dim: int = field(default=128, metadata={"help": "to base_model input dimension"})
     output_dim: int = field(default=128, metadata={"help": "base_model output dimension"})
+    cfm_loss_beta: float = field(default=0.5, metadata={"help": "beta parameter for CFM loss calculation, only used when training the flow model"})
 
 
 @dataclass
@@ -88,6 +66,10 @@ class FlowControlCfg(FlowMatchingCfg):
     decoder_hidden_dim: list[int] = field(default_factory=lambda: [256, 128], metadata={"help": "hidden dimension for the action decoder"})
     coder_hidden_dim: list[int] = field(
         default_factory=lambda: [128, 256], metadata={"help": "hidden dimension for the state and action encoder in the flow model"}
+    )
+    # utility parameters
+    train_model: bool = field(
+        default=True, metadata={"help": "whether to train the flow model, if False, the flow model will be frozen and only used for inference"}
     )
 
 
