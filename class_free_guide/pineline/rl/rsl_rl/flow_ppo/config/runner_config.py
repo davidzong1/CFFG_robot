@@ -5,7 +5,7 @@ from dataclasses import MISSING
 from typing import Literal
 
 
-@dataclass
+@dataclass(kw_only=True)
 class FpoRslRlOnPolicyRunnerCfg:
     """Configuration of the runner for on-policy algorithms."""
 
@@ -66,17 +66,17 @@ class FpoRslRlOnPolicyRunnerCfg:
     logger: Literal["tensorboard", "neptune", "wandb"] = "tensorboard"
     """The logger to use. Default is tensorboard."""
 
-    neptune_project: str = "isaaclab"
-    """The neptune project name. Default is "isaaclab"."""
+    neptune_project: str = "mjlab"
+    """The neptune project name. Default is "mjlab"."""
 
-    wandb_project: str = "isaaclab"
-    """The wandb project name. Default is "isaaclab"."""
+    wandb_project: str = "mjlab"
+    """The wandb project name. Default is "mjlab"."""
 
     # Evaluation configuration
     eval_episodes: int = 10
     """Number of episodes to run per evaluation mode. Default is 10."""
 
-    flow_eval_modes: list[str] = ["zero", "random"]
+    flow_eval_modes: list[str] = field(default_factory=lambda: ["zero", "random"])
     """Evaluation modes for flow matching deterministic sampling. Default is ["zero", "random"].
 
     Available modes:

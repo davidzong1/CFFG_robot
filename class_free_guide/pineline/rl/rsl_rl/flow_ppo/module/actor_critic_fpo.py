@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from typing import TYPE_CHECKING
 
-from class_free_guide.pineline.rl.rsl_rl.flow_ppo.utils.utils import resolve_nn_activation
+from class_free_guide.network.utils.utils import resolve_nn_activation
 
 if TYPE_CHECKING:
     from class_free_guide.pineline.rl.rsl_rl.flow_ppo.config import FpoRslRlPpoActorCriticCfg

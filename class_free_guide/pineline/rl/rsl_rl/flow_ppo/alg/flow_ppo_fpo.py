@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from class_free_guide.pineline.rl.rsl_rl.flow_ppo.module.actor_critic_fpo import ActorCritic
 from class_free_guide.pineline.rl.rsl_rl.flow_ppo.module.ema import ExponentialMovingAverage
-from class_free_guide.pineline.rl.rsl_rl.flow_ppo.rollout.rollout_storage import RolloutStorage
+from class_free_guide.pineline.rl.rsl_rl.flow_ppo.storage.rollout_storage_fpo import RolloutStorage
 
 if TYPE_CHECKING:
     from class_free_guide.pineline.rl.rsl_rl.flow_ppo.config import FpoRslRlPpoAlgorithmCfg

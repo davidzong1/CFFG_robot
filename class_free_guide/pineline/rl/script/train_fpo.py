@@ -95,6 +95,7 @@ class FpoTrainConfig:
     num_envs: int = 4096
     seed: int = 49
     max_iterations: int = 2000
+    headless: bool = False
     # FPO-specific flags (from isaaclab_fpo/cli_args.py)
     resume: bool = False
     load_run: str = ".*"
@@ -221,7 +222,8 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
         print(f"[INFO] Logging experiment in directory: {log_dir}")
 
     # Create mjlab environment
-    env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None)
+    render_mode = "rgb_array" if (cfg.video and not cfg.headless) else None
+    env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode=render_mode)
 
     log_root_path = log_dir.parent
 
@@ -230,8 +232,10 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
     if cfg.resume:
         resume_path = get_checkpoint_path(log_root_path, cfg.load_run, cfg.load_checkpoint)
 
-    # Video recording (rank 0 only)
-    if cfg.video and rank == 0:
+    # Video recording (rank 0 only; skipped in headless mode)
+    if cfg.video and cfg.headless:
+        print("[WARNING] Video recording is disabled in headless mode.")
+    elif cfg.video and rank == 0:
         env = VideoRecorder(
             env,
             video_folder=Path(log_dir) / "videos" / "train",
@@ -328,7 +332,18 @@ def launch_fpo_training(task_id: str, args: FpoTrainConfig | None = None):
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, selected_gpus))
-    os.environ["MUJOCO_GL"] = "egl"
+
+    # Headless mode: use EGL/OSMesa backend and disable viewer
+    if args.headless:
+        os.environ["MUJOCO_GL"] = "egl"
+        # Disable GPU rendering output (X11/GLX bypass)
+        os.environ.pop("DISPLAY", None)
+        # Disable the viewer in env config if present
+        if hasattr(args.env, "viewer") and args.env.viewer is not None:
+            args.env.viewer = None
+        print("[INFO] Headless mode enabled: MuJoCo GL backend set to EGL, viewer disabled.")
+    else:
+        os.environ["MUJOCO_GL"] = "egl"
 
     if num_gpus <= 1:
         # CPU or single GPU

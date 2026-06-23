@@ -5,6 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "fpo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/class_free_guide/pineline/rl/script/train_fpo.py",
+            "console": "integratedTerminal",
+            "args": "Unitree-Go2-Flat-FPO --num_envs 4096 --headless"
+        },
+        {
             "name": "rl",
             "type": "debugpy",
             "request": "launch",

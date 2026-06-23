@@ -38,7 +38,30 @@ class OnPolicyRunner:
         self._configure_multi_gpu()
 
         # resolve dimensions of observations
-        obs, extras = self.env.get_observations()
+        obs_ret = self.env.get_observations()
+        print(f"[DEBUG] type of get_observations(): {type(obs_ret)}")
+        if hasattr(obs_ret, "keys"):
+            print(f"[DEBUG] obs_ret keys: {obs_ret.keys()}")
+
+        if isinstance(obs_ret, tuple):
+            obs = obs_ret[0]
+            extras = obs_ret[1] if len(obs_ret) > 1 else {}
+        else:
+            if isinstance(obs_ret, dict) or type(obs_ret).__name__ == "TensorDict":
+                if "policy" in obs_ret:
+                    obs = obs_ret["policy"]
+                elif "actor" in obs_ret:
+                    obs = obs_ret["actor"]
+                else:
+                    obs = obs_ret
+
+                extras = {"observations": {}}
+                if "critic" in obs_ret:
+                    extras["observations"]["critic"] = obs_ret["critic"]
+            else:
+                obs = obs_ret
+                extras = {"observations": {}}
+
         num_obs = obs.shape[1]
 
         # resolve type of privileged observations

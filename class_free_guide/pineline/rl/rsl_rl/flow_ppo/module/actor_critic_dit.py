@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from class_free_guide.pineline.flow_matching.flow_cfg import FlowControlCfg
 from class_free_guide.pineline.flow_matching.flow_control import FlowControlDIT
 from class_free_guide.network.base.mlp import MLP
-from class_free_guide.pineline.rl.rsl_rl.flow_ppo.utils.utils import resolve_nn_activation
+from class_free_guide.network.utils.utils import resolve_nn_activation
 
 if TYPE_CHECKING:
     from class_free_guide.pineline.rl.rsl_rl.flow_ppo.config import FpoRslRlPpoActorCriticCfg
