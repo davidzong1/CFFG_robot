@@ -43,24 +43,7 @@ class OnPolicyRunner:
         if hasattr(obs_ret, "keys"):
             print(f"[DEBUG] obs_ret keys: {obs_ret.keys()}")
 
-        if isinstance(obs_ret, tuple):
-            obs = obs_ret[0]
-            extras = obs_ret[1] if len(obs_ret) > 1 else {}
-        else:
-            if isinstance(obs_ret, dict) or type(obs_ret).__name__ == "TensorDict":
-                if "policy" in obs_ret:
-                    obs = obs_ret["policy"]
-                elif "actor" in obs_ret:
-                    obs = obs_ret["actor"]
-                else:
-                    obs = obs_ret
-
-                extras = {"observations": {}}
-                if "critic" in obs_ret:
-                    extras["observations"]["critic"] = obs_ret["critic"]
-            else:
-                obs = obs_ret
-                extras = {"observations": {}}
+        obs, extras = self._process_obs_ret(obs_ret)
 
         num_obs = obs.shape[1]
 
@@ -127,6 +110,40 @@ class OnPolicyRunner:
             __file__,
         ]  # log the git status of the main repository and the current file's repository (in case they are different)
 
+    @staticmethod
+    def _process_obs_ret(obs_ret):
+        """Extract obs tensor and extras dict from get_observations() or step() return.
+
+        Handles both the old API (tuple) and new API (TensorDict/dict) return types,
+        ensuring compatibility across IsaacLab and MJLab environments.
+
+        Args:
+            obs_ret: Return value from get_observations() or the first element of step().
+
+        Returns:
+            tuple: (obs, extras) where obs is a tensor and extras is a dict
+                   with an "observations" key containing privileged observation groups.
+        """
+        if isinstance(obs_ret, tuple):
+            obs = obs_ret[0]
+            extras = obs_ret[1] if len(obs_ret) > 1 else {}
+        else:
+            if isinstance(obs_ret, dict) or type(obs_ret).__name__ == "TensorDict":
+                if "policy" in obs_ret:
+                    obs = obs_ret["policy"]
+                elif "actor" in obs_ret:
+                    obs = obs_ret["actor"]
+                else:
+                    obs = obs_ret
+
+                extras = {"observations": {}}
+                if "critic" in obs_ret:
+                    extras["observations"]["critic"] = obs_ret["critic"]
+            else:
+                obs = obs_ret
+                extras = {"observations": {}}
+        return obs, extras
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -159,7 +176,8 @@ class OnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
 
         # start learning
-        obs, extras = self.env.get_observations()
+        obs_ret = self.env.get_observations()
+        obs, extras = self._process_obs_ret(obs_ret)
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
@@ -200,8 +218,12 @@ class OnPolicyRunner:
 
                     # Step the environment
                     env_start = time.perf_counter()
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs_ret, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     env_step_time += time.perf_counter() - env_start
+
+                    # Extract observation tensor from return value
+                    # (handles both TensorDict from MJLab/IsaacLab and legacy tuple API)
+                    obs, step_extras = self._process_obs_ret(obs_ret)
 
                     # Randomize episode length for reset environments to prevent synchronization
                     if self.randomize_reset_episode_progress > 0:
@@ -223,7 +245,7 @@ class OnPolicyRunner:
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
-                        privileged_obs = self.privileged_obs_normalizer(infos["observations"][self.privileged_obs_type].to(self.device))
+                        privileged_obs = self.privileged_obs_normalizer(step_extras["observations"][self.privileged_obs_type].to(self.device))
                     else:
                         privileged_obs = obs
 
@@ -632,7 +654,8 @@ class OnPolicyRunner:
 
             for mode in eval_modes:
                 # Reset environments for each mode
-                obs, _ = self.env.reset()
+                obs_ret, _ = self.env.reset()
+                obs, _extras = self._process_obs_ret(obs_ret)
                 obs = obs.to(self.device)
 
                 # Collect episodes for this mode
@@ -662,7 +685,8 @@ class OnPolicyRunner:
                         actions = self.alg.policy.act_inference(norm_obs, eval_mode=mode, eval_fixed_seed=eval_fixed_seed)
 
                     # Step environment
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs_ret, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs, _step_extras = self._process_obs_ret(obs_ret)
                     obs = obs.to(self.device)
 
                     # Accumulate rewards and lengths

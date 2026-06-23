@@ -94,7 +94,7 @@ class FpoTrainConfig:
     # Override flags (from isaaclab_fpo/scripts/train.py CLI args)
     num_envs: int = 4096
     seed: int = 49
-    max_iterations: int = 2000
+    max_iterations: int = 20000
     headless: bool = False
     # FPO-specific flags (from isaaclab_fpo/cli_args.py)
     resume: bool = False
@@ -262,9 +262,13 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
         dump_yaml(log_dir / "params" / "env.yaml", asdict(cfg.env))
         dump_yaml(log_dir / "params" / "agent.yaml", asdict(cfg.agent))
 
+    # Determine number of training iterations
+    num_learning_iterations = cfg.agent.max_iterations
+    print(f"[INFO] Training for {num_learning_iterations} iterations (max_iterations={cfg.agent.max_iterations})")
+
     # Run training
     runner.learn(
-        num_learning_iterations=cfg.agent.max_iterations,
+        num_learning_iterations=num_learning_iterations,
         init_at_random_ep_len=True,
     )
 
