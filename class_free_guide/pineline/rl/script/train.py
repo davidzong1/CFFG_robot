@@ -1,7 +1,9 @@
 """Script to train RL agent with RSL-RL."""
 
+import ast
 import logging
 import os
+import random
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -25,12 +27,24 @@ class TrainConfig:
     env: ManagerBasedRlEnvCfg
     agent: RslRlBaseRunnerCfg
     motion_file: str | None = None
-    video: bool = False
+    video: bool = True
     video_length: int = 200
-    video_interval: int = 2000
+    video_interval: int = 5000
     enable_nan_guard: bool = False
     torchrunx_log_dir: str | None = None
     gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
+    # Override flags
+    num_envs: int = 4096
+    seed: int = 49
+    max_iterations: int = 20000
+    headless: bool = False
+    resume: bool = False
+    load_run: str = ".*"
+    load_checkpoint: str = "model_.*.pt"
+    experiment_name: str | None = None
+    run_name: str | None = None
+    logger: Literal["tensorboard", "neptune", "wandb"] = "tensorboard"
+    log_project_name: str | None = None
 
     @staticmethod
     def from_task(task_id: str) -> "TrainConfig":
@@ -39,12 +53,79 @@ class TrainConfig:
         return TrainConfig(env=env_cfg, agent=agent_cfg)
 
 
+# ---------------------------------------------------------------------------
+# W&B sweep overrides
+# ---------------------------------------------------------------------------
+
+
+def _parse_sweep_overrides() -> tuple[dict, dict]:
+    """Parse W&B sweep overrides from sys.argv positional args.
+
+    W&B sweeps pass parameters as positional args like:
+        agent.policy.actor_hidden_dims=[256,256,256]  agent.algorithm.clip_param=0.05
+
+    Returns two dicts: one for 'agent.*' overrides and one for 'env.*' overrides.
+    """
+    agent_overrides: dict = {}
+    env_overrides: dict = {}
+
+    for arg in sys.argv[1:]:
+        if "=" not in arg or arg.startswith("-"):
+            continue
+
+        key, value_str = arg.split("=", 1)
+
+        # Parse the value
+        try:
+            value = ast.literal_eval(value_str)
+        except (ValueError, SyntaxError):
+            if value_str.lower() == "true":
+                value = True
+            elif value_str.lower() == "false":
+                value = False
+            else:
+                value = value_str
+
+        # Route to agent or env overrides
+        if key.startswith("agent."):
+            parts = key[len("agent.") :].split(".")
+        elif key.startswith("env."):
+            parts = key[len("env.") :].split(".")
+        else:
+            continue
+
+        # Build nested dict from dotted path
+        d = agent_overrides if key.startswith("agent.") else env_overrides
+        for part in parts[:-1]:
+            d = d.setdefault(part, {})
+        d[parts[-1]] = value
+
+    return agent_overrides, env_overrides
+
+
+def _apply_dict_overrides(target, overrides: dict) -> None:
+    """Apply nested dict overrides to a dataclass instance.
+
+    Args:
+        target: The dataclass instance to update.
+        overrides: Nested dict of attribute overrides.
+    """
+    for key, value in overrides.items():
+        if isinstance(value, dict) and hasattr(target, key):
+            _apply_dict_overrides(getattr(target, key), value)
+        elif hasattr(target, key):
+            setattr(target, key, value)
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if cuda_visible == "":
-        device = "cpu"
-        seed = cfg.agent.seed
-        rank = 0
+        raise ValueError("Cannot found cuda device. Please check your CUDA_VISIBLE_DEVICES environment variable.")
     else:
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         rank = int(os.environ.get("RANK", "0"))
@@ -87,7 +168,13 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     if rank == 0:
         print(f"[INFO] Logging experiment in directory: {log_dir}")
 
-    env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None)
+    # headless overrides video
+    if cfg.headless:
+        cfg.video = False
+
+    # Create mjlab environment
+    render_mode = "rgb_array" if cfg.video else None
+    env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode=render_mode)
 
     log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 
@@ -96,7 +183,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
         # Load checkpoint from local filesystem.
         resume_path = get_checkpoint_path(log_root_path, cfg.agent.load_run, cfg.agent.load_checkpoint)
 
-    # Only record videos on rank 0 to avoid multiple workers writing to the same files.
+    # Video recording (rank 0 only)
     if cfg.video and rank == 0:
         env = VideoRecorder(
             env,
@@ -137,6 +224,42 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 def launch_training(task_id: str, args: TrainConfig | None = None):
     args = args or TrainConfig.from_task(task_id)
 
+    # Update agent config from CLI overrides
+    if args.experiment_name:
+        args.agent.experiment_name = args.experiment_name
+    if args.run_name:
+        args.agent.run_name = args.run_name
+    if args.resume:
+        args.agent.resume = args.resume
+        args.agent.load_run = args.load_run
+        args.agent.load_checkpoint = args.load_checkpoint
+    if args.logger:
+        args.agent.logger = args.logger
+    if args.log_project_name and args.agent.logger in ("wandb", "neptune"):
+        args.agent.wandb_project = args.log_project_name
+        args.agent.neptune_project = args.log_project_name
+
+    # Apply CLI overrides
+    # --num_envs: override the number of parallel environments
+    if args.num_envs is not None:
+        args.env.scene.num_envs = args.num_envs
+    # --seed: override random seed (-1 for random seed)
+    if args.seed is not None:
+        if args.seed == -1:
+            args.agent.seed = random.randint(0, 10000)
+        else:
+            args.agent.seed = args.seed
+    # --max_iterations: override training iterations
+    if args.max_iterations is not None:
+        args.agent.max_iterations = args.max_iterations
+
+    # Apply W&B sweep overrides
+    agent_overrides, env_overrides = _parse_sweep_overrides()
+    if agent_overrides:
+        _apply_dict_overrides(args.agent, agent_overrides)
+    if env_overrides:
+        _apply_dict_overrides(args.env, env_overrides)
+
     # Create log directory once before launching workers.
     log_root_path = Path("logs") / "rsl_rl" / args.agent.experiment_name
     log_root_path.resolve()
@@ -153,7 +276,16 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, selected_gpus))
-    os.environ["MUJOCO_GL"] = "egl"
+
+    # Headless mode: use EGL/OSMesa backend and disable viewer
+    if args.headless:
+        os.environ["MUJOCO_GL"] = "egl"
+        # Disable GPU rendering output (X11/GLX bypass)
+        os.environ.pop("DISPLAY", None)
+        # Disable the viewer in env config if present
+        if hasattr(args.env, "viewer") and args.env.viewer is not None:
+            args.env.viewer = None
+        print("[INFO] Headless mode enabled: MuJoCo GL backend set to EGL, viewer disabled.")
 
     if num_gpus <= 1:
         # CPU or single GPU: run directly without torchrunx.
@@ -196,7 +328,6 @@ def main():
         tyro.extras.literal_type_from_choices(all_tasks),
         add_help=False,
         return_unknown_args=True,
-        config=mjlab.TYRO_FLAGS,
     )
 
     args = tyro.cli(
@@ -204,7 +335,6 @@ def main():
         args=remaining_args,
         default=TrainConfig.from_task(chosen_task),
         prog=sys.argv[0] + f" {chosen_task}",
-        config=mjlab.TYRO_FLAGS,
     )
 
     del remaining_args

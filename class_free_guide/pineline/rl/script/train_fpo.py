@@ -85,9 +85,9 @@ class FpoTrainConfig:
 
     env: ManagerBasedRlEnvCfg
     agent: FpoRslRlOnPolicyRunnerCfg
-    video: bool = False
+    video: bool = True
     video_length: int = 200
-    video_interval: int = 2000
+    video_interval: int = 5000
     enable_nan_guard: bool = False
     torchrunx_log_dir: str | None = None
     gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
@@ -221,8 +221,12 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
     if rank == 0:
         print(f"[INFO] Logging experiment in directory: {log_dir}")
 
+    # headless overrides video
+    if cfg.headless:
+        cfg.video = False
+
     # Create mjlab environment
-    render_mode = "rgb_array" if (cfg.video and not cfg.headless) else None
+    render_mode = "rgb_array" if cfg.video else None
     env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode=render_mode)
 
     log_root_path = log_dir.parent
@@ -232,10 +236,8 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
     if cfg.resume:
         resume_path = get_checkpoint_path(log_root_path, cfg.load_run, cfg.load_checkpoint)
 
-    # Video recording (rank 0 only; skipped in headless mode)
-    if cfg.video and cfg.headless:
-        print("[WARNING] Video recording is disabled in headless mode.")
-    elif cfg.video and rank == 0:
+    # Video recording (rank 0 only)
+    if cfg.video and rank == 0:
         env = VideoRecorder(
             env,
             video_folder=Path(log_dir) / "videos" / "train",
@@ -346,8 +348,6 @@ def launch_fpo_training(task_id: str, args: FpoTrainConfig | None = None):
         if hasattr(args.env, "viewer") and args.env.viewer is not None:
             args.env.viewer = None
         print("[INFO] Headless mode enabled: MuJoCo GL backend set to EGL, viewer disabled.")
-    else:
-        os.environ["MUJOCO_GL"] = "egl"
 
     if num_gpus <= 1:
         # CPU or single GPU

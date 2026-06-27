@@ -14,7 +14,7 @@ with open(path.join(here, "requirements.txt"), encoding="utf-8") as f:
 
 setup(
     name="class_free_guide",
-    version="0.0",
+    version="1.0",
     description="class-free guide by flow matching",
     author="David Zong",
     author_email="805483796@qq.com",
