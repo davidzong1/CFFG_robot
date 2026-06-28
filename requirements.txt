@@ -15,3 +15,6 @@ transformers
 huggingface_hub
 imageio-ffmpeg
 tensordict
+# Optional: LLM-driven reward supervisor (class_free_guide/pineline/rl/supervisor/).
+anthropic
+openai

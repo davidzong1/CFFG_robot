@@ -1,0 +1,15 @@
+{
+  "name": "energy_efficient",
+  "summary": "Train a smooth, low-effort gait. Favor smoothness and small actions over peak tracking accuracy and over showy gait shapes.",
+  "priorities": [
+    "Strong action_rate_l2 penalty for smooth motor commands",
+    "Strong joint_acc_l2 penalty for low joint acceleration",
+    "Moderate tracking_lin_vel — accurate enough but not aggressive",
+    "soft_landing reward to avoid impact spikes"
+  ],
+  "avoid": [
+    "Overweighting foot_gait or foot_clearance shaping",
+    "Letting tracking_lin_vel weight grow large enough to cause oscillations"
+  ],
+  "notes": "Tracking error within ~10-15% of command is acceptable if energy proxies improve."
+}

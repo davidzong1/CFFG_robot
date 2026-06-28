@@ -104,6 +104,14 @@ class FpoTrainConfig:
     run_name: str | None = None
     logger: Literal["tensorboard", "neptune", "wandb"] = "tensorboard"
     log_project_name: str | None = None
+    # TensorBoard local broadcasting: when set, starts a TensorBoard server
+    # on this port binding to 0.0.0.0 so remote devices can monitor training.
+    tb_port: int = 114514
+    # LLM-driven reward-weight supervisor (rank 0, single-GPU runs only).
+    supervisor: bool = False
+    supervisor_config: str | None = None
+    # Training-objective JSON path. CLI override beats supervisor_config.objective_path.
+    objective: str | None = None
 
     @staticmethod
     def from_task(task_id: str) -> "FpoTrainConfig":
@@ -184,6 +192,41 @@ def _parse_sweep_overrides() -> tuple[dict, dict]:
 # ---------------------------------------------------------------------------
 
 
+def _start_tensorboard_server(logdir: str, port: int) -> None:
+    """Start a TensorBoard server in a background daemon thread.
+
+    Binds to 0.0.0.0 so remote devices on the same network can access the
+    TensorBoard dashboard at http://<host-ip>:<port>.
+
+    Args:
+        logdir: Path to the TensorBoard log directory.
+        port: Port number for the TensorBoard web server.
+    """
+    import threading
+
+    from tensorboard import program
+
+    def _run_tb():
+        tb = program.TensorBoard()
+        tb.configure(
+            argv=[
+                None,
+                "--logdir",
+                logdir,
+                "--port",
+                str(port),
+                "--bind_all",
+                "--reload_multifile",
+                "true",
+            ]
+        )
+        url = tb.launch()
+        print(f"[INFO] TensorBoard server started at {url} (logdir: {logdir})")
+
+    thread = threading.Thread(target=_run_tb, daemon=True)
+    thread.start()
+
+
 def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
     """Run FPO training for a single process.
 
@@ -220,6 +263,8 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
 
     if rank == 0:
         print(f"[INFO] Logging experiment in directory: {log_dir}")
+
+    _start_tensorboard_server(str(log_dir.parent), cfg.tb_port)
 
     # headless overrides video
     if cfg.headless:
@@ -264,15 +309,53 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
         dump_yaml(log_dir / "params" / "env.yaml", asdict(cfg.env))
         dump_yaml(log_dir / "params" / "agent.yaml", asdict(cfg.agent))
 
+    # Optional LLM reward supervisor (rank 0 only).
+    supervisor = None
+    if cfg.supervisor and rank == 0:
+        if cfg.headless:
+            raise ValueError("[ ERROR ] When using LLM automatic parameter tuning, the headless mode cannot be activated!")
+        try:
+            from class_free_guide.pineline.rl.supervisor import (
+                Supervisor,
+                SupervisorConfig,
+            )
+
+            sup_cfg_path = cfg.supervisor_config or str(Path(__file__).resolve().parents[1] / "supervisor" / "config" / "supervisor.yaml")
+            sup_cfg = SupervisorConfig.load(sup_cfg_path)
+            # CLI --objective overrides whatever the supervisor yaml said.
+            if cfg.objective:
+                sup_cfg.objective_path = cfg.objective
+            supervisor = Supervisor(
+                env=env,
+                writer=None,
+                log_dir=log_dir,
+                config=sup_cfg,
+                writer_getter=lambda: getattr(runner, "writer", None),
+                iter_getter=lambda: int(getattr(runner, "current_learning_iteration", 0)),
+            )
+            supervisor.start()
+            print(
+                f"[INFO] Reward supervisor enabled "
+                f"(provider={sup_cfg.provider}, interval={sup_cfg.interval_min:.0f}min, "
+                f"objective={supervisor.objective.name})."
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to start reward supervisor: {e}")
+            supervisor = None
+
     # Determine number of training iterations
     num_learning_iterations = cfg.agent.max_iterations
     print(f"[INFO] Training for {num_learning_iterations} iterations (max_iterations={cfg.agent.max_iterations})")
 
     # Run training
-    runner.learn(
-        num_learning_iterations=num_learning_iterations,
-        init_at_random_ep_len=True,
-    )
+    try:
+        runner.learn(
+            num_learning_iterations=num_learning_iterations,
+            init_at_random_ep_len=True,
+        )
+    finally:
+        if supervisor is not None:
+            supervisor.stop()
 
     env.close()
 

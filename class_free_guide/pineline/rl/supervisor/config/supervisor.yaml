@@ -1,0 +1,61 @@
+# Default supervisor configuration.
+# Override fields by passing --supervisor_config path/to/your.yaml.
+
+interval_min: 15.0           # one analysis cycle every 15 minutes
+cooldown_iters: 200          # don't re-apply within this many iters
+warmup_iters: 200            # don't run the first cycle until training has warmed up
+
+max_patch_fields: 3          # at most this many terms modified per cycle
+max_rel_change: 0.30         # |new-old|/|old| per cycle per term
+max_consecutive_rollbacks: 2 # blacklist a term after this many rollbacks
+
+metric_window: 200
+metric_downsample: 50
+clips_per_cycle: 2
+video_frames_per_clip: 6
+
+# ---- LLM provider -----------------------------------------------------------
+# Choose one: "anthropic" | "openai" | "openrouter" | "stub"
+#
+# anthropic:
+#   Set ANTHROPIC_API_KEY in your environment.
+#   Uses ephemeral prompt caching on the system message.
+#
+# openai:
+#   Set OPENAI_API_KEY (or api_key_env) in your environment.
+#   Optionally set api_base for a self-hosted / vLLM endpoint.
+#
+# openrouter (any OpenAI-compatible router):
+#   REQUIRED: api_base, api_key_env
+#   OPTIONAL: extra_headers (injected as HTTP headers)
+#
+#   Works with any OpenAI-compatible endpoint:
+#     OpenRouter:    api_base: https://openrouter.ai/api/v1
+#     DeepInfra:     api_base: https://api.deepinfra.com/v1/openai
+#     Together:      api_base: https://api.together.xyz/v1
+#     Fireworks:     api_base: https://api.fireworks.ai/inference/v1
+#     Groq:          api_base: https://api.groq.com/openai/v1
+#     vLLM (local):  api_base: http://localhost:8000/v1
+#
+#   Model names follow the router's convention.
+#   For OpenRouter use "provider/model" syntax (e.g. anthropic/claude-opus-4-7).
+#
+# stub:
+#   No API key needed. Returns empty patches — for offline tests only.
+# ----------------------------------------------------------------------------
+provider: anthropic
+model: claude-opus-4-7
+max_tokens: 2048
+temperature: 0.3
+api_base: null
+api_key_env: ANTHROPIC_API_KEY
+# Extra HTTP headers forwarded to the LLM API (useful for OpenRouter
+# ranking signals, auth proxies, etc.).  Ignored for provider=anthropic.
+extra_headers: {}
+#   HTTP-Referer: "https://github.com/your/repo"
+#   X-Title: "Go2 Supervisor"
+
+objective_path: class_free_guide/pineline/rl/supervisor/objectives/stable_walk.json
+
+# Relative to repo root; falls back to packaged schema.yaml when null.
+schema_path: null

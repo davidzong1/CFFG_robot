@@ -1,0 +1,14 @@
+{
+  "name": "fast_walk",
+  "summary": "Train a fast, responsive gait that maximizes adherence to the commanded velocity, including aggressive directional changes. Tolerate jerkier actions if they buy tracking accuracy.",
+  "priorities": [
+    "High tracking_lin_vel and track_angular_velocity rewards",
+    "Fast response to velocity command changes",
+    "Strong foot_gait reward to maintain a clear, repeatable gait at speed"
+  ],
+  "avoid": [
+    "Over-penalizing action_rate to the point of sluggish response",
+    "Letting the body become so smooth that tracking suffers"
+  ],
+  "notes": "Some action_rate cost is acceptable. Falls or extreme tilts are still failures."
+}

@@ -1,0 +1,16 @@
+{
+  "name": "stable_walk",
+  "summary": "Train a stable, low-oscillation trot that strictly tracks the commanded velocity. Stability comes first; raw speed and aesthetics are secondary.",
+  "priorities": [
+    "Body stays close to upright (small body_orientation_l2 magnitude)",
+    "Low body angular velocity and angular momentum",
+    "Clean foot contacts with minimal slipping and soft landings",
+    "Tracking error is minimized only after the policy is stable"
+  ],
+  "avoid": [
+    "Aggressive action changes that destabilize the body",
+    "Trading away tracking_lin_vel weight to chase shaping rewards",
+    "Reward hacking via foot_gait while ignoring orientation"
+  ],
+  "notes": "If you must choose between stability and tracking accuracy, choose stability."
+}

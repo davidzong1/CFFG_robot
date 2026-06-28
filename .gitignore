@@ -148,4 +148,13 @@ dmypy.json
 logs/**
 wandb/**
 ref_lib/
+
+# Agent
 .claude/**
+.codex/**
+.Agent/**
+
+
+!class_free_guide/pineline/rl/supervisor/config/schema.yaml
+!class_free_guide/pineline/rl/supervisor/config/supervisor.yaml
+class_free_guide/pineline/rl/supervisor/config/**

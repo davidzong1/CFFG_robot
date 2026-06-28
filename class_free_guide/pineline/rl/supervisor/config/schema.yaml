@@ -1,0 +1,86 @@
+# Reward-weight schema for the LLM supervisor.
+#
+# Each entry declares the allowed range for a reward term. The supervisor
+# refuses any patch outside [min, max] and limits per-cycle relative change
+# (see SupervisorConfig.max_rel_change).
+#
+# Defaults below mirror task_cfg.py:261-361 (Unitree-Go2 velocity task).
+# Positive rewards: max ≈ 5× current, min ≈ 0.1× current.
+# Penalties: max = 0, min ≈ 5× current.
+
+terms:
+  track_linear_velocity:
+    default: 1.0
+    min: 0.1
+    max: 5.0
+    description: "Linear velocity tracking reward. Primary task signal."
+  track_angular_velocity:
+    default: 1.0
+    min: 0.1
+    max: 5.0
+    description: "Angular velocity tracking reward."
+  body_orientation_l2:
+    default: -1.0
+    min: -5.0
+    max: 0.0
+    description: "Penalty for body tilt away from upright."
+  pose:
+    default: 1.0
+    min: 0.0
+    max: 5.0
+    description: "Variable-posture reward (stand/walk/run dependent)."
+  body_ang_vel:
+    default: -0.05
+    min: -0.5
+    max: 0.0
+    description: "Penalty on body angular velocity."
+  angular_momentum:
+    default: -0.025
+    min: -0.25
+    max: 0.0
+    description: "Penalty on body angular momentum."
+  is_terminated:
+    default: -200.0
+    min: -500.0
+    max: -50.0
+    description: "Penalty on early termination (fall/timeout)."
+  joint_acc_l2:
+    default: -0.00000025
+    min: -0.000005
+    max: 0.0
+    description: "Joint acceleration L2 penalty (smoothness)."
+  joint_pos_limits:
+    default: -10.0
+    min: -50.0
+    max: 0.0
+    description: "Penalty for hitting joint position limits."
+  action_rate_l2:
+    default: -0.05
+    min: -0.5
+    max: 0.0
+    description: "Penalty on action change rate (smoothness)."
+  foot_gait:
+    default: 0.5
+    min: 0.0
+    max: 2.5
+    description: "Bonus for matching the prescribed gait pattern."
+  foot_clearance:
+    default: -1.0
+    min: -5.0
+    max: 0.0
+    description: "Penalty for incorrect swing-foot height."
+  foot_slip:
+    default: -0.25
+    min: -2.0
+    max: 0.0
+    description: "Penalty for slipping while in contact."
+  soft_landing:
+    default: -0.001
+    min: -0.01
+    max: 0.0
+    description: "Penalty for hard foot contacts at touchdown."
+  stand_still:
+    default: -1.0
+    min: -5.0
+    max: 0.0
+    description: "Penalty for moving when zero-velocity command is issued."
