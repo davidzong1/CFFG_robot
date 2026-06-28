@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import time
 import torch
 
@@ -220,6 +221,10 @@ class OnPolicyRunner:
             # Check for supervisor-issued early stop signal.
             if self.early_stop_event is not None and self.early_stop_event.is_set():
                 print(f"[FPO runner] Early stop at iteration {it}. Score threshold met by supervisor.")
+                break
+            # Multi-GPU: also check for .stop file written by rank 0
+            if self.logger.log_dir is not None and (Path(self.logger.log_dir) / ".stop").exists():
+                print(f"[FPO runner] Early stop at iteration {it}. .stop file detected.")
                 break
 
             start = time.perf_counter()
@@ -755,7 +760,10 @@ class OnPolicyRunner:
         if self.gpu_global_rank >= self.gpu_world_size:
             raise ValueError(f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
 
-        # initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        # initialize torch distributed (skip if already initialized by torchrunx)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        else:
+            print(f"[INFO] torch.distributed already initialized (by torchrunx), skipping duplicate init.")
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)

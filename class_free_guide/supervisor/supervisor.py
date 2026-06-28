@@ -440,7 +440,11 @@ class Supervisor:
                             "next_cycle_in_s": int(remaining),
                         }
                     )
-                    pub.publish(msg)
+                    if not pub.publish(msg):
+                        log.warning(
+                            "[supervisor] heartbeat publish failed (topic=%s)",
+                            self.cfg.ipc_topic,
+                        )
                 was_subscribed = subscribed
             except Exception:
                 pass  # swallow — don't crash the heartbeat thread
@@ -457,7 +461,11 @@ class Supervisor:
             msg = dzipc.Supervisor()
             msg.update_time = update_time
             msg.additional_info = additional_info
-            self._ipc_pub.publish(msg)
+            if not self._ipc_pub.publish(msg):
+                log.warning(
+                    "[supervisor] flush pending event failed (topic=%s)",
+                    self.cfg.ipc_topic,
+                )
         except Exception:
             pass
 
@@ -478,7 +486,12 @@ class Supervisor:
             msg = dzipc.Supervisor()
             msg.update_time = update_time
             msg.additional_info = additional_info
-            self._ipc_pub.publish(msg)
+            if not self._ipc_pub.publish(msg):
+                log.warning(
+                    "[supervisor] ipc publish failed (topic=%s, event=%s)",
+                    self.cfg.ipc_topic,
+                    update_time,
+                )
         except Exception as exc:
             log.debug("[supervisor] ipc publish failed: %s", exc)
 

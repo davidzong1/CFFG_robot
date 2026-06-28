@@ -271,6 +271,18 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
 
     print(f"[INFO] FPO Training with: device={device}, seed={seed}, rank={rank}")
 
+    # Override MASTER_PORT with the port we allocated in the launcher
+    # process.  torchrunx sets MASTER_PORT to the agent's internal
+    # metadata port (agent_payloads[0].port) which was obtained via
+    # get_open_port() but never actually bound — it may still be free
+    # or it may have been reused by a system service before the worker
+    # runs.  Our _NCCL_MASTER_PORT is guaranteed free because the
+    # launcher just bound it, closed the socket, and immediately handed
+    # it to the NCCL init across all ranks.
+    if "_NCCL_MASTER_PORT" in os.environ:
+        os.environ["MASTER_PORT"] = os.environ["_NCCL_MASTER_PORT"]
+        print(f"[INFO] Overriding MASTER_PORT to {os.environ['MASTER_PORT']} (via _NCCL_MASTER_PORT)")
+
     # Enable NaN guard if requested
     if cfg.enable_nan_guard:
         cfg.env.sim.nan_guard.enabled = True
@@ -278,8 +290,7 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
 
     if rank == 0:
         print(f"[INFO] Logging experiment in directory: {log_dir}")
-
-    _start_tensorboard_server(str(log_dir.parent), cfg.tb_port)
+        _start_tensorboard_server(str(log_dir.parent), cfg.tb_port)
 
     # Create mjlab environment.
     # EGL backend supports offscreen rendering; video recording works
@@ -346,6 +357,17 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
             )
             supervisor.start()
             runner.early_stop_event = stopping_event
+
+            # Multi-GPU: write a .stop file in the shared log directory so all
+            # ranks detect the stop signal (threading.Event is process-local).
+            def _write_stop_file():
+                stopping_event.wait()
+                stop_path = Path(log_dir) / ".stop"
+                stop_path.touch()
+                print("[INFO] Wrote .stop file for multi-GPU stop propagation.")
+
+            threading.Thread(target=_write_stop_file, daemon=True).start()
+
             print(
                 f"[INFO] Reward supervisor enabled "
                 f"(provider={sup_cfg.provider}, interval={sup_cfg.interval_min:.0f}min, "
@@ -463,11 +485,22 @@ def launch_fpo_training(task_id: str, args: FpoTrainConfig | None = None):
                 os.environ["TORCHRUNX_LOG_DIR"] = str(log_dir / "torchrunx")
 
         print(f"[INFO] Launching FPO training with {num_gpus} GPUs", flush=True)
+        # Pick a free port for NCCL TCPStore so it cannot collide with
+        # torchrunx's own internal communication ports (launcher_port is
+        # held by LauncherAgentGroup and would conflict if reused).
+        import socket as _socket
+
+        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        _s.bind(("", 0))
+        _nccl_port = _s.getsockname()[1]
+        _s.close()
+
         torchrunx.Launcher(
             hostnames=["localhost"],
             workers_per_host=num_gpus,
-            backend=None,  # Let rsl_rl handle process group initialization
+            backend=None,  # Let our code handle init_process_group with correct device ordering
             copy_env_vars=torchrunx.DEFAULT_ENV_VARS_FOR_COPY + ("MUJOCO*",),
+            extra_env_vars={"_NCCL_MASTER_PORT": str(_nccl_port)},
         ).run(run_fpo_train, task_id, args, log_dir)
 
 

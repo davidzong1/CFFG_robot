@@ -1,6 +1,9 @@
 """Script to train RL agent with RSL-RL."""
 
+from __future__ import annotations
+
 import ast
+import inspect
 import logging
 import os
 import random
@@ -11,6 +14,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
+
+import torch
 
 # ---------------------------------------------------------------------------
 # Headless rendering: MUST set MUJOCO_GL BEFORE any MuJoCo import.
@@ -31,6 +36,11 @@ from mjlab.utils.gpu import select_gpus
 from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
+
+from class_free_guide.supervisor import (
+    Supervisor,
+    SupervisorConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -196,6 +206,12 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
     print(f"[INFO] Training with: device={device}, seed={seed}, rank={rank}")
 
+    # Override MASTER_PORT with the port we allocated in the launcher
+    # process (same rationale as train_fpo.py).
+    if "_NCCL_MASTER_PORT" in os.environ:
+        os.environ["MASTER_PORT"] = os.environ["_NCCL_MASTER_PORT"]
+        print(f"[INFO] Overriding MASTER_PORT to {os.environ['MASTER_PORT']} (via _NCCL_MASTER_PORT)")
+
     # Check if this is a tracking task by checking for motion command.
     is_tracking_task = "motion" in cfg.env.commands and isinstance(cfg.env.commands["motion"], MotionCommandCfg)
 
@@ -221,8 +237,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
     if rank == 0:
         print(f"[INFO] Logging experiment in directory: {log_dir}")
-
-    _start_tensorboard_server(str(log_dir.parent), cfg.tb_port)
+        _start_tensorboard_server(str(log_dir.parent), cfg.tb_port)
 
     # Create mjlab environment.
     # EGL backend supports offscreen rendering; video recording works
@@ -253,12 +268,70 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     agent_cfg = asdict(cfg.agent)
     env_cfg = asdict(cfg.env)
 
+    # If torchrunx created the process group (backend != None), patch
+    # rsl_rl's _configure_multi_gpu to avoid calling init_process_group twice.
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        from rsl_rl.runners.on_policy_runner import OnPolicyRunner as _RslPolicyRunner
+        if not hasattr(_RslPolicyRunner, "_torchrunx_patched"):
+
+            def _safe_configure_multi_gpu(self):
+                self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
+                self.is_distributed = self.gpu_world_size > 1
+                if not self.is_distributed:
+                    self.gpu_local_rank = 0
+                    self.gpu_global_rank = 0
+                    self.cfg["multi_gpu"] = None
+                    return
+                self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
+                self.gpu_global_rank = int(os.getenv("RANK", "0"))
+                self.cfg["multi_gpu"] = {
+                    "global_rank": self.gpu_global_rank,
+                    "local_rank": self.gpu_local_rank,
+                    "world_size": self.gpu_world_size,
+                }
+                if self.device != f"cuda:{self.gpu_local_rank}":
+                    raise ValueError(
+                        f"Device '{self.device}' does not match expected device "
+                        f"for local rank '{self.gpu_local_rank}'."
+                    )
+                if self.gpu_local_rank >= self.gpu_world_size:
+                    raise ValueError(
+                        f"Local rank '{self.gpu_local_rank}' is greater than or "
+                        f"equal to world size '{self.gpu_world_size}'."
+                    )
+                if self.gpu_global_rank >= self.gpu_world_size:
+                    raise ValueError(
+                        f"Global rank '{self.gpu_global_rank}' is greater than or "
+                        f"equal to world size '{self.gpu_world_size}'."
+                    )
+                if not torch.distributed.is_initialized():
+                    torch.distributed.init_process_group(
+                        backend="nccl",
+                        rank=self.gpu_global_rank,
+                        world_size=self.gpu_world_size,
+                    )
+                torch.cuda.set_device(self.gpu_local_rank)
+
+            _RslPolicyRunner._configure_multi_gpu = _safe_configure_multi_gpu
+            _RslPolicyRunner._torchrunx_patched = True
+
+    # Load supervisor configuration unconditionally, like train_fpo.py does,
+    # so it is available for both the runner constructor and the supervisor.
+    sup_cfg_path = cfg.supervisor_config or str(Path(__file__).resolve().parents[1] / "supervisor" / "config" / "supervisor.yaml")
+    sup_cfg = SupervisorConfig.load(sup_cfg_path)
+
     runner_cls = load_runner_cls(task_id)
     if runner_cls is None:
         runner_cls = MjlabOnPolicyRunner
 
+    # Pass supervisor_cfg to runner constructor when the runner supports it
+    # (e.g. VelocityOnPolicyRunner from flow_ppo, FpoOnPolicyRunner).
     runner_kwargs = {}
-    runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
+    sig = inspect.signature(runner_cls.__init__)
+    if "supervisor_cfg" in sig.parameters or "sup_cfg" in sig.parameters:
+        runner = runner_cls(env, agent_cfg, sup_cfg, str(log_dir), device, **runner_kwargs)
+    else:
+        runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
 
     runner.add_git_repo_to_log(__file__)
     if resume_path is not None:
@@ -275,13 +348,6 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     is_supervisor = cfg.supervisor
     if cfg.supervisor and rank == 0:
         try:
-            from class_free_guide.supervisor import (
-                Supervisor,
-                SupervisorConfig,
-            )
-
-            sup_cfg_path = cfg.supervisor_config or str(Path(__file__).resolve().parents[1] / "supervisor" / "config" / "supervisor.yaml")
-            sup_cfg = SupervisorConfig.load(sup_cfg_path)
             # CLI --objective overrides whatever the supervisor yaml said.
             if cfg.objective:
                 sup_cfg.objective_path = cfg.objective
@@ -297,14 +363,27 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
             )
             supervisor.start()
 
-            # Monitor thread: when the supervisor sets stopping_event, send
-            # SIGINT to interrupt the blocking runner.learn() call.  The
-            # existing try/finally block ensures clean teardown.
-            def _early_stop_monitor() -> None:
-                stopping_event.wait()
-                os.kill(os.getpid(), signal.SIGINT)
+            # Prefer clean early_stop_event when the runner supports it
+            # (e.g. VelocityOnPolicyRunner from flow_ppo, FpoOnPolicyRunner).
+            # Fall back to SIGINT for runners without built-in support.
+            if hasattr(runner, "early_stop_event"):
+                runner.early_stop_event = stopping_event
 
-            threading.Thread(target=_early_stop_monitor, daemon=True).start()
+                # Multi-GPU: write a .stop file in the shared log directory so all
+                # ranks detect the stop signal (threading.Event is process-local).
+                def _write_stop_file():
+                    stopping_event.wait()
+                    stop_path = Path(log_dir) / ".stop"
+                    stop_path.touch()
+                    print("[INFO] Wrote .stop file for multi-GPU stop propagation.")
+
+                threading.Thread(target=_write_stop_file, daemon=True).start()
+            else:
+                def _early_stop_monitor() -> None:
+                    stopping_event.wait()
+                    os.kill(os.getpid(), signal.SIGINT)
+
+                threading.Thread(target=_early_stop_monitor, daemon=True).start()
 
             print(
                 f"[INFO] Reward supervisor enabled "
@@ -320,7 +399,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     print(f"[INFO] Training for {num_learning_iterations} iterations (max_iterations={real_max_iterations})")
 
     try:
-        runner.learn(num_learning_iterations=real_max_iterations, init_at_random_ep_len=True)
+        runner.learn(num_learning_iterations=num_learning_iterations, init_at_random_ep_len=True)
     finally:
         if supervisor is not None:
             supervisor.stop()
@@ -415,11 +494,21 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
                 os.environ["TORCHRUNX_LOG_DIR"] = str(log_dir / "torchrunx")
 
         print(f"[INFO] Launching training with {num_gpus} GPUs", flush=True)
+        # Pick a free port for NCCL TCPStore so it cannot collide with
+        # torchrunx's own internal communication ports.
+        import socket as _socket
+
+        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        _s.bind(("", 0))
+        _nccl_port = _s.getsockname()[1]
+        _s.close()
+
         torchrunx.Launcher(
             hostnames=["localhost"],
             workers_per_host=num_gpus,
-            backend=None,  # Let rsl_rl handle process group initialization.
+            backend=None,  # Let our code handle init_process_group with correct device ordering
             copy_env_vars=torchrunx.DEFAULT_ENV_VARS_FOR_COPY + ("MUJOCO*",),
+            extra_env_vars={"_NCCL_MASTER_PORT": str(_nccl_port)},
         ).run(run_train, task_id, args, log_dir)
 
 

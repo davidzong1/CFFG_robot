@@ -52,14 +52,16 @@ rl # select (g)创建容器， then (s)启动， then (e)进入
 
 - 使用LLM在线监督调参
 
-```python
+```bash
 
-python class_free_guide/pineline/rl/script/train_fpo.py Unitree-Go2-Flat-FPO --num_envs 4096 --supervisor --headless
+python class_free_guide/pineline/rl/script/train_fpo.py Unitree-Go2-Flat-FPO --headless --num_envs 4096 --supervisor --supervisor_config [ custom supervisor.yaml path ]
 
 ```
 
 - Router LLM refer configure 
 
 ![class_free_guide/supervisor/config/image/router_configure.png](class_free_guide/supervisor/config/image/router_configure.png)
+
+### ⭐相关文档查看[Supervisor调参配置指南](class_free_guide/supervisor/doc/menu.md)
 
 # TODO

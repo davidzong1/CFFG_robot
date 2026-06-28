@@ -9,7 +9,6 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING
 from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 from class_free_guide.pineline.rl.rsl_rl.flow_ppo.module.actor_critic_dit import ActorCritic
-from isaaclab_fpo.modules.ema import ExponentialMovingAverage
 from class_free_guide.pineline.rl.rsl_rl.flow_ppo.storage.rollout_storage_fpo import RolloutStorage
 
 if TYPE_CHECKING:
