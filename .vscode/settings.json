@@ -1,5 +1,8 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "cmake.sourceDirectory": "/home/zwc/class_free_guide/ref_lib/cusadi"
+    "cmake.sourceDirectory": "/home/zwc/class_free_guide/ref_lib/cusadi",
+    "python.analysis.extraPaths": [
+        "/home/zwc/class_free_guide/threeparty/cpp_ipc_dds/python"
+    ]
 }

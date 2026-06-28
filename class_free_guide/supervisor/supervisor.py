@@ -17,6 +17,7 @@ from .objective import TrainingObjective
 from .patcher import RewardPatcher
 from .rollback import RollbackEvaluator
 from .schema import RewardSchema
+import dzipc
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +108,16 @@ class Supervisor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+        # ---- IPC (dzipc shared-memory publisher) ---------------------------
+        self._ipc_pub: "dzipc.PublisherIPC" | None = None
+        self._ipc_msg_template: "dzipc.Supervisor" | None = None
+        self._ipc_topic_data: "dzipc.TopicData" | None = None
+        self._next_cycle_at: float = 0.0       # timestamp when the next cycle fires
+        self._ipc_heartbeat_ready = threading.Event()
+        self._ipc_heartbeat_thread: threading.Thread | None = None
+        self._last_ipc_event: tuple[str, str] | None = None  # (update_time, additional_info) pending for subscriber
+        self._last_ipc_event_lock = threading.Lock()
+
         (self.log_dir / "supervisor").mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -187,6 +198,8 @@ class Supervisor:
                 "objective": self.objective.as_dict(),
             }
         )
+        # Wire up the SHM publisher so external tooling can monitor us.
+        self._init_ipc_publisher()
         self._thread = threading.Thread(target=self._loop, name="rl-supervisor", daemon=True)
         self._thread.start()
         log.info(
@@ -199,6 +212,8 @@ class Supervisor:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        if self._ipc_heartbeat_thread is not None:
+            self._ipc_heartbeat_thread.join(timeout=min(timeout, 2.0))
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
@@ -209,6 +224,8 @@ class Supervisor:
     def _loop(self) -> None:
         # Warmup: let training produce some data before the first cycle.
         min_to_sec = int(self.cfg.interval_min * 60)
+        self._next_cycle_at = time.time() + min_to_sec
+        self._ipc_heartbeat_ready.set()
         warm_until = time.time() + min_to_sec
         while not self._stop.is_set():
             if time.time() >= warm_until:
@@ -221,6 +238,12 @@ class Supervisor:
             except Exception as exc:
                 log.exception("[supervisor] cycle failed: %s", exc)
                 self._write_audit({"kind": "cycle_error", "error": repr(exc)})
+                self._publish_status(
+                    update_time="error",
+                    additional_info=json.dumps({"event": "cycle_error", "error": repr(exc)}),
+                )
+            # Schedule next cycle; heartbeat reads _next_cycle_at.
+            self._next_cycle_at = time.time() + min_to_sec
             # Sleep in small chunks so stop() returns promptly.
             slept = 0.0
             while slept < min_to_sec and not self._stop.is_set():
@@ -261,6 +284,10 @@ class Supervisor:
     def _run_cycle(self) -> None:
         if self.guardrails.killswitch_present():
             self._write_audit({"kind": "paused"})
+            self._publish_status(
+                update_time="paused",
+                additional_info=json.dumps({"event": "paused"}),
+            )
             return
 
         current_iter = self._iter_getter()
@@ -312,6 +339,12 @@ class Supervisor:
             )
             # Still evaluate rollback against any previously armed rule.
             self.rollback.maybe_rollback(snapshot_summary, current_iter)
+            self._publish_status(
+                update_time=str(current_iter),
+                additional_info=json.dumps(
+                    {"event": "rejected", "iter": current_iter, "reason": guard.reason}
+                ),
+            )
             return
 
         record = self.patcher.apply(
@@ -325,6 +358,129 @@ class Supervisor:
         self.guardrails.note_apply(current_iter)
         if record.rollback_if:
             self.rollback.watch(record.rollback_if)
+        self._publish_status(
+            update_time=str(current_iter),
+            additional_info=json.dumps(
+                {
+                    "event": "patched",
+                    "iter": current_iter,
+                    "version": self.patcher.version,
+                    "weights": current_weights,
+                    "clamped": guard.clamped_patch,
+                }
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # IPC (shared-memory publisher for external monitoring)
+    # ------------------------------------------------------------------
+
+    def _init_ipc_publisher(self) -> None:
+        """Create a SHM publisher so external tooling can watch supervisor state.
+
+        Call once, typically from ``start()``.  No-op when IPC is disabled in
+        config or when the dzipc native module cannot be loaded.
+        """
+        if not self.cfg.ipc_enabled:
+            return
+        try:
+            self._ipc_msg_template = dzipc.Supervisor()
+            self._ipc_topic_data = dzipc.make_topic_data(self._ipc_msg_template)
+            self._ipc_pub = dzipc.PublisherIPCPtrMake(
+                self._ipc_topic_data,
+                self.cfg.ipc_topic,
+                self.cfg.ipc_domain,
+                dzipc.IPC_SHM,
+                verbose=False,
+            )
+            self._ipc_pub.InitChannel()
+            log.info(
+                "[supervisor] ipc publisher ready: topic=%s domain=%s transport=shm",
+                self.cfg.ipc_topic,
+                self.cfg.ipc_domain,
+            )
+            # Start a background thread that publishes heartbeat every second.
+            self._ipc_heartbeat_thread = threading.Thread(
+                target=self._ipc_heartbeat_loop, name="supervisor-ipc", daemon=True
+            )
+            self._ipc_heartbeat_thread.start()
+        except Exception as exc:
+            log.warning("[supervisor] ipc publisher init failed: %s", exc)
+            self._ipc_pub = None
+            self._ipc_msg_template = None
+            self._ipc_topic_data = None
+
+    def _ipc_heartbeat_loop(self) -> None:
+        """Background thread: publish status every 1 s so external monitors see
+        up-to-date remaining time until the next supervisor cycle.
+
+        When a subscriber first connects (or reconnects after a gap) the most
+        recent event-driven status is replayed so late-joining monitors receive
+        the current state immediately.
+        """
+        # Wait until _loop() has written the first _next_cycle_at.
+        self._ipc_heartbeat_ready.wait()
+        was_subscribed = False
+        while not self._stop.is_set():
+            try:
+                pub = self._ipc_pub
+                subscribed = pub is not None and pub.has_subscribed()
+                if subscribed:
+                    # Subscriber just appeared — replay last event first.
+                    if not was_subscribed:
+                        self._flush_pending_event()
+                    remaining = max(0.0, self._next_cycle_at - time.time())
+                    msg = dzipc.Supervisor()
+                    msg.update_time = str(int(remaining))
+                    msg.additional_info = json.dumps(
+                        {
+                            "event": "heartbeat",
+                            "iter": self._iter_getter(),
+                            "version": self.patcher.version,
+                            "next_cycle_in_s": int(remaining),
+                        }
+                    )
+                    pub.publish(msg)
+                was_subscribed = subscribed
+            except Exception:
+                pass  # swallow — don't crash the heartbeat thread
+            self._stop.wait(timeout=1.0)
+
+    def _flush_pending_event(self) -> None:
+        """Replay the last stored event so a late-joining subscriber gets current state."""
+        with self._last_ipc_event_lock:
+            event = self._last_ipc_event
+        if event is None or self._ipc_pub is None or self._ipc_msg_template is None:
+            return
+        update_time, additional_info = event
+        try:
+            msg = dzipc.Supervisor()
+            msg.update_time = update_time
+            msg.additional_info = additional_info
+            self._ipc_pub.publish(msg)
+        except Exception:
+            pass
+
+    def _publish_status(self, update_time: str, additional_info: str = "") -> None:
+        """Publish a Supervisor message over SHM (fire-and-forget).
+
+        The event is always stored so the heartbeat thread can replay it when a
+        subscriber connects later.  When a subscriber is already present the
+        publish happens immediately (no C++ stderr warning).
+        """
+        with self._last_ipc_event_lock:
+            self._last_ipc_event = (update_time, additional_info)
+        if self._ipc_pub is None or self._ipc_msg_template is None:
+            return
+        if not self._ipc_pub.has_subscribed():
+            return
+        try:
+            msg = dzipc.Supervisor()
+            msg.update_time = update_time
+            msg.additional_info = additional_info
+            self._ipc_pub.publish(msg)
+        except Exception as exc:
+            log.debug("[supervisor] ipc publish failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Parameter helpers (delegate to callbacks)

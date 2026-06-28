@@ -69,7 +69,10 @@ extra_headers: {}
 #   HTTP-Referer: "https://github.com/your/repo"
 #   X-Title: "Go2 Supervisor"
 
-objective_path: class_free_guide/pineline/rl/supervisor/objectives/stable_walk.json
+objective_path: class_free_guide/supervisor/objectives/stable_walk.json
 
 # Relative to repo root; falls back to packaged schema.yaml when null.
 schema_path: null
+ipc_enabled: true
+ipc_topic: supervisor_status
+ipc_domain: 1

@@ -54,11 +54,7 @@ class Logger:
         self.cfg = cfg
         self.env_cfg = env_cfg
         self.num_envs = num_envs
-        self.num_steps_per_env = (
-            num_steps_per_env
-            if num_steps_per_env is not None
-            else _cfg_get(cfg, "num_steps_per_env", 0)
-        )
+        self.num_steps_per_env = num_steps_per_env if num_steps_per_env is not None else _cfg_get(cfg, "num_steps_per_env", 0)
         self.gpu_world_size = gpu_world_size
         self.device = device
         self.git_status_repos = git_status_repos if git_status_repos is not None else [rsl_rl.__file__]
@@ -207,8 +203,14 @@ class Logger:
             # Log episode extras
             extras_string = ""
             if self.ep_extras:
+                # Collect all keys from ALL episode extras (union), not just the first one.
+                # Using the first episode's keys alone causes inconsistent console
+                # output when different episodes report different metric subsets.
+                all_keys = set()
+                for ep_info in self.ep_extras:
+                    all_keys.update(ep_info.keys())
                 # Iterate over all keys in the episode info dictionary
-                for key in self.ep_extras[0]:
+                for key in sorted(all_keys):
                     infotensor = torch.tensor([], device=self.device)
                     # Iterate over all steps
                     for ep_info in self.ep_extras:
@@ -331,8 +333,7 @@ class Logger:
                 f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
                 f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
             )
-            log_string += f"""{"#" * width}\n"""
-            log_string += f"""{additional_info}\n""" if additional_info else ""
+            log_string += f"""{"additional_info:":>{pad}} {additional_info}\n""" if additional_info else ""
             print(log_string)
 
             # Upload available videos

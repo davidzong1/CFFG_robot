@@ -56,6 +56,11 @@ class SupervisorConfig:
     # Training-objective JSON; overrides the built-in default if set.
     objective_path: str | None = None
 
+    # IPC (dzipc shared-memory publisher for external monitoring)
+    ipc_enabled: bool = False
+    ipc_topic: str = "supervisor_status"
+    ipc_domain: int = 1
+
     extra: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod

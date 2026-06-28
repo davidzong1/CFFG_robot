@@ -22,13 +22,16 @@ from ..module.actor_critic_fpo import (
     ActorCritic,
 )
 from rsl_rl.modules import EmpiricalNormalization
+from class_free_guide.supervisor import SupervisorConfig
+import dzipc
 
 
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
-    def __init__(self, env: VecEnv, train_cfg: FpoRslRlOnPolicyRunnerCfg, log_dir: str | None = None, device="cpu"):
+    def __init__(self, env: VecEnv, train_cfg: FpoRslRlOnPolicyRunnerCfg, sup_cfg: SupervisorConfig | None, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
+        self.sup_cfg = sup_cfg
         self.device = device
         self.env = env
 
@@ -109,6 +112,31 @@ class OnPolicyRunner:
         )
         self.current_learning_iteration = 0
         self.early_stop_event = None  # threading.Event, set by supervisor when training should stop
+        self._ipc_msg_template = None
+        self._ipc_sub = None
+        self._ipc_topic_data = None
+        self._init_ipc_subscriber()  # Initialize IPC subscriber for supervisor state monitoring
+
+    def _init_ipc_subscriber(self) -> None:
+        """Create a SHM subscriber so external tooling can watch supervisor state."""
+        if not self.sup_cfg.ipc_enabled:
+            return
+        try:
+            self._ipc_msg_template = dzipc.Supervisor()
+            self._ipc_topic_data = dzipc.make_topic_data(self._ipc_msg_template)
+            self._ipc_sub = dzipc.SubscriberIPCPtrMake(
+                self._ipc_topic_data,
+                self.sup_cfg.ipc_topic,
+                self.sup_cfg.ipc_domain,
+                10,
+                dzipc.IPC_SHM,
+                verbose=False,
+            )
+            self._ipc_sub.InitChannel()
+        except Exception as exc:
+            self._ipc_sub = None
+            self._ipc_msg_template = None
+            self._ipc_topic_data = None
 
     @staticmethod
     def _process_obs_ret(obs_ret):
@@ -187,6 +215,7 @@ class OnPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        topic_msg = None
         for it in range(start_iter, tot_iter):
             # Check for supervisor-issued early stop signal.
             if self.early_stop_event is not None and self.early_stop_event.is_set():
@@ -198,7 +227,6 @@ class OnPolicyRunner:
             env_step_time = 0.0
             action_time = 0.0
             process_time = 0.0
-
             # Rollout
             with torch.no_grad():
                 for _ in range(self.num_steps_per_env):
@@ -276,6 +304,17 @@ class OnPolicyRunner:
             self.current_learning_iteration = it
             # log info
             if self.logger.writer is not None:
+                sup_update_time: str = ""
+                if (self._ipc_sub is not None) and (self._ipc_topic_data is not None):
+                    [topic_success, self._ipc_topic_data] = self._ipc_sub.try_get(
+                        self._ipc_topic_data
+                    )  # update topic data with latest supervisor state
+                    topic_msg = self._ipc_topic_data.topic() if topic_success else topic_msg
+                    sup_update_time = (
+                        f"Supervisor update time: {topic_msg.update_time}"
+                        if (topic_success) or (topic_msg is not None)
+                        else "Supervisor update time: N/A"
+                    )
                 self.logger.log(
                     it=it,
                     start_it=start_iter,
@@ -290,6 +329,7 @@ class OnPolicyRunner:
                         "process_time": process_time,
                         "simulation_time": simulation_time,
                     },
+                    additional_info=sup_update_time,
                 )
 
                 # Save model

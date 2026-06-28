@@ -69,6 +69,13 @@ if [ ! -f "$MARKER" ]; then
     if [ -f setup.py ] || [ -f pyproject.toml ]; then
         echo ">> First shell in container: installing package in editable mode..."
         pip install -e . && touch "$MARKER"
+        cd threeparty/cpp_ipc_dds
+        mkdir -p build && cd build
+        cmake .. && make -j$(nproc)
+        sudo make install
+        cd ../python
+        pip install .
+        cd ../../../
         clear
         echo ">> Package installed in editable mode. You can now use the package directly."
     fi

@@ -196,10 +196,15 @@ def _parse_sweep_overrides() -> tuple[dict, dict]:
 
     return agent_overrides, env_overrides
 
+    # ---------------------------------------------------------------------------
+    # Training
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
+
+from class_free_guide.supervisor import (
+    Supervisor,
+    SupervisorConfig,
+)
 
 
 def _start_tensorboard_server(logdir: str, port: int) -> None:
@@ -300,11 +305,14 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
         )
         print("[INFO] Recording videos during training.")
 
+    sup_cfg_path = cfg.supervisor_config or str(Path(__file__).resolve().parents[1] / "supervisor" / "config" / "supervisor.yaml")
+    sup_cfg = SupervisorConfig.load(sup_cfg_path)
+
     # Wrap environment for FPO runner (same interface as isaaclab FpoRslRlVecEnvWrapper)
     env = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
 
     # Create FPO runner with the FPO config dataclass
-    runner = FpoOnPolicyRunner(env, cfg.agent, log_dir=str(log_dir), device=device)
+    runner = FpoOnPolicyRunner(env, cfg.agent, sup_cfg, log_dir=str(log_dir), device=device)
 
     runner.add_git_repo_to_log(__file__)
 
@@ -322,13 +330,7 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
     is_supervisor = cfg.supervisor
     if cfg.supervisor and rank == 0:
         try:
-            from class_free_guide.supervisor import (
-                Supervisor,
-                SupervisorConfig,
-            )
 
-            sup_cfg_path = cfg.supervisor_config or str(Path(__file__).resolve().parents[1] / "supervisor" / "config" / "supervisor.yaml")
-            sup_cfg = SupervisorConfig.load(sup_cfg_path)
             # CLI --objective overrides whatever the supervisor yaml said.
             if cfg.objective:
                 sup_cfg.objective_path = cfg.objective
