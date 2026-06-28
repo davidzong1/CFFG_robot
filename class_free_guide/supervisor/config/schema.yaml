@@ -40,9 +40,9 @@ terms:
     max: 0.0
     description: "Penalty on body angular momentum."
   is_terminated:
-    default: -200.0
+    default: -20.0
     min: -500.0
-    max: -50.0
+    max: 0.0
     description: "Penalty on early termination (fall/timeout)."
   joint_acc_l2:
     default: -0.00000025
@@ -76,7 +76,7 @@ terms:
     description: "Penalty for slipping while in contact."
   soft_landing:
     default: -0.001
-    min: -0.01
+    min: -0.1
     max: 0.0
     description: "Penalty for hard foot contacts at touchdown."
   stand_still:

@@ -155,6 +155,6 @@ ref_lib/
 .Agent/**
 
 
-!class_free_guide/pineline/rl/supervisor/config/schema.yaml
-!class_free_guide/pineline/rl/supervisor/config/supervisor.yaml
-class_free_guide/pineline/rl/supervisor/config/**
+class_free_guide/supervisor/config/**.yaml
+!class_free_guide/supervisor/config/schema.yaml
+!class_free_guide/supervisor/config/supervisor.yaml

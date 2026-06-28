@@ -17,12 +17,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 
 import pytest
 
-from class_free_guide.pineline.rl.supervisor import Supervisor, SupervisorConfig
-from class_free_guide.pineline.rl.supervisor.llm_client import LLMClient
-from class_free_guide.pineline.rl.supervisor.metric_collector import (
+from class_free_guide.supervisor.supervisor import (
+    Supervisor,
+    SupervisorCallbacks,
+    SupervisorConfig,
+)
+from class_free_guide.supervisor.llm_client import LLMClient
+from class_free_guide.supervisor.metric_collector import (
     MetricSnapshot,
     ScalarSeries,
 )
@@ -85,12 +90,19 @@ class ScriptedClient(LLMClient):
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Helpers
 # ---------------------------------------------------------------------------
 
 
+def _seed_snapshot() -> MetricSnapshot:
+    s = ScalarSeries(name="Train/mean_reward")
+    s.steps = [10, 20, 30]
+    s.values = [0.1, 0.2, 0.3]
+    return MetricSnapshot(step=30, series={"Train/mean_reward": s})
+
+
 def _make_supervisor(tmp_path: Path, patch: dict[str, float]):
-    # Use a tight set of weights so guardrail rel-change math is predictable.
+    """Factory using from_rl_env (backward-compat RL path)."""
     weights = {
         "track_linear_velocity": 1.0,
         "action_rate_l2": -0.05,
@@ -98,7 +110,7 @@ def _make_supervisor(tmp_path: Path, patch: dict[str, float]):
     }
     env = FakeEnv(weights)
     cfg = SupervisorConfig(
-        interval_min=60.0,  # ensure the daemon loop never fires during the test
+        interval_min=60.0,
         cooldown_iters=0,
         warmup_iters=0,
         max_patch_fields=3,
@@ -107,7 +119,7 @@ def _make_supervisor(tmp_path: Path, patch: dict[str, float]):
         video_frames_per_clip=0,
         provider="stub",
     )
-    sup = Supervisor(
+    sup = Supervisor.from_rl_env(
         env=env,
         writer=None,
         log_dir=tmp_path,
@@ -118,20 +130,68 @@ def _make_supervisor(tmp_path: Path, patch: dict[str, float]):
     return sup, env
 
 
-def _seed_snapshot() -> MetricSnapshot:
-    s = ScalarSeries(name="Train/mean_reward")
-    s.steps = [10, 20, 30]
-    s.values = [0.1, 0.2, 0.3]
-    return MetricSnapshot(step=30, series={"Train/mean_reward": s})
+def _make_supervisor_for_early_stop(
+    tmp_path: Path,
+    patch: dict[str, float],
+    score: int,
+    *,
+    early_stopping: bool = True,
+    pass_score: float = 75.0,
+    min_training_iters: int = 50,
+    current_iter: int = 100,
+):
+    """Factory for early-stop test supervisors with a score-bearing LLM client."""
+    weights = {
+        "track_linear_velocity": 1.0,
+        "action_rate_l2": -0.05,
+        "foot_slip": -0.25,
+    }
+    env = FakeEnv(weights)
+
+    class ScoredClient(ScriptedClient):
+        def diagnose(self, *args, **kwargs):
+            result = super().diagnose(*args, **kwargs)
+            result["score"] = score
+            return result
+
+    cfg = SupervisorConfig(
+        interval_min=60.0,
+        cooldown_iters=0,
+        warmup_iters=0,
+        max_patch_fields=3,
+        max_rel_change=0.30,
+        clips_per_cycle=0,
+        video_frames_per_clip=0,
+        provider="stub",
+        early_stopping=early_stopping,
+        pass_score=pass_score,
+        min_training_iters=min_training_iters,
+    )
+    stopping_event = threading.Event()
+    sup = Supervisor.from_rl_env(
+        env=env,
+        writer=None,
+        log_dir=tmp_path,
+        config=cfg,
+        llm=ScoredClient(patch),
+        iter_getter=lambda: current_iter,
+        stopping_event=stopping_event,
+    )
+    return sup, env, stopping_event
+
+
+# ---------------------------------------------------------------------------
+# Tests — RL backward-compat (via from_rl_env)
+# ---------------------------------------------------------------------------
 
 
 def test_one_cycle_applies_patch(tmp_path, monkeypatch):
     patch = {"action_rate_l2": -0.04}  # +20% relative change, within bounds
     sup, env = _make_supervisor(tmp_path, patch)
 
-    # Bypass disk-based MetricCollector / VideoSampler.
-    monkeypatch.setattr(sup.collector, "snapshot", _seed_snapshot)
-    monkeypatch.setattr(sup.video_sampler, "frames", lambda overlay=None: [])
+    # Bypass disk-based collector / video-sampler via callback monkeypatch.
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
 
     # Write v00 baseline (normally done by start()).
     sup.patcher.write_initial_snapshot(sup._current_weights())
@@ -151,8 +211,8 @@ def test_one_cycle_applies_patch(tmp_path, monkeypatch):
     assert {"track_linear_velocity", "foot_slip"} <= set(data["weights"].keys())
 
     # Audit log records the apply.
-    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().splitlines()
-    kinds = [json.loads(line).get("kind") for line in audit]
+    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().strip().split("\n\n")
+    kinds = [json.loads(block)["kind"] for block in audit]
     assert "applied" in kinds
 
 
@@ -162,8 +222,8 @@ def test_out_of_bounds_patch_rejected(tmp_path, monkeypatch):
     patch = {"action_rate_l2": -0.20}
     sup, env = _make_supervisor(tmp_path, patch)
 
-    monkeypatch.setattr(sup.collector, "snapshot", _seed_snapshot)
-    monkeypatch.setattr(sup.video_sampler, "frames", lambda overlay=None: [])
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
     sup.patcher.write_initial_snapshot(sup._current_weights())
 
     sup._run_cycle()
@@ -173,16 +233,16 @@ def test_out_of_bounds_patch_rejected(tmp_path, monkeypatch):
     # No v01.yaml.
     assert not (tmp_path / "reward_cfg" / "v01.yaml").exists()
     # audit has a rejected entry.
-    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().splitlines()
-    assert any(json.loads(line).get("kind") == "rejected" for line in audit)
+    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().strip().split("\n\n")
+    assert any(json.loads(block)["kind"] == "rejected" for block in audit)
 
 
 def test_killswitch_pauses_cycle(tmp_path, monkeypatch):
     patch = {"action_rate_l2": -0.04}
     sup, env = _make_supervisor(tmp_path, patch)
 
-    monkeypatch.setattr(sup.collector, "snapshot", _seed_snapshot)
-    monkeypatch.setattr(sup.video_sampler, "frames", lambda overlay=None: [])
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
     sup.patcher.write_initial_snapshot(sup._current_weights())
 
     (tmp_path / "supervisor").mkdir(exist_ok=True)
@@ -193,8 +253,8 @@ def test_killswitch_pauses_cycle(tmp_path, monkeypatch):
     # No apply, no v01.yaml.
     assert env.reward_manager.get_term_cfg("action_rate_l2").weight == pytest.approx(-0.05)
     assert not (tmp_path / "reward_cfg" / "v01.yaml").exists()
-    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().splitlines()
-    assert any(json.loads(line).get("kind") == "paused" for line in audit)
+    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().strip().split("\n\n")
+    assert any(json.loads(block)["kind"] == "paused" for block in audit)
 
 
 def test_objective_loaded_and_passed_to_llm(tmp_path, monkeypatch):
@@ -229,7 +289,7 @@ def test_objective_loaded_and_passed_to_llm(tmp_path, monkeypatch):
         objective_path=str(obj_path),
     )
     client = ScriptedClient(patch)
-    sup = Supervisor(
+    sup = Supervisor.from_rl_env(
         env=env,
         writer=None,
         log_dir=tmp_path,
@@ -242,8 +302,8 @@ def test_objective_loaded_and_passed_to_llm(tmp_path, monkeypatch):
     assert sup.objective.name == "stable_walk"
     assert "upright body" in sup.objective.priorities
 
-    monkeypatch.setattr(sup.collector, "snapshot", _seed_snapshot)
-    monkeypatch.setattr(sup.video_sampler, "frames", lambda overlay=None: [])
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
     sup.patcher.write_initial_snapshot(sup._current_weights())
     sup._run_cycle()
 
@@ -254,9 +314,14 @@ def test_objective_loaded_and_passed_to_llm(tmp_path, monkeypatch):
     assert "body roll spikes" in client.last_objective_block
 
 
+# ---------------------------------------------------------------------------
+# OpenRouter client tests
+# ---------------------------------------------------------------------------
+
+
 def test_openrouter_requires_api_base(monkeypatch):
     """provider=openrouter without api_base must raise with a helpful message."""
-    from class_free_guide.pineline.rl.supervisor.llm_client import build_client
+    from class_free_guide.supervisor.llm_client import build_client
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-key")
 
@@ -267,7 +332,7 @@ def test_openrouter_requires_api_base(monkeypatch):
 
 def test_openrouter_reads_base_url_from_config(monkeypatch):
     """api_base in config must become the OpenAI client's base_url."""
-    from class_free_guide.pineline.rl.supervisor.llm_client import OpenRouterClient, build_client
+    from class_free_guide.supervisor.llm_client import OpenRouterClient, build_client
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-key")
 
@@ -282,7 +347,7 @@ def test_openrouter_reads_base_url_from_config(monkeypatch):
 
 def test_openrouter_supports_any_router(monkeypatch):
     """Any OpenAI-compatible base_url must work (Groq, Fireworks, vLLM...)."""
-    from class_free_guide.pineline.rl.supervisor.llm_client import OpenRouterClient, build_client
+    from class_free_guide.supervisor.llm_client import OpenRouterClient, build_client
 
     monkeypatch.setenv("GROQ_API_KEY", "sk-groq-test")
     cfg = SupervisorConfig(
@@ -297,7 +362,7 @@ def test_openrouter_supports_any_router(monkeypatch):
 
 def test_openrouter_extra_headers_forwarded(monkeypatch):
     """extra_headers dict must reach the OpenAI client."""
-    from class_free_guide.pineline.rl.supervisor.llm_client import OpenRouterClient, build_client
+    from class_free_guide.supervisor.llm_client import OpenRouterClient, build_client
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-key")
 
@@ -319,7 +384,7 @@ def test_openrouter_extra_headers_forwarded(monkeypatch):
 
 def test_openrouter_missing_key_raises(monkeypatch):
     """OpenRouter must complain when no API key env var is set."""
-    from class_free_guide.pineline.rl.supervisor.llm_client import build_client
+    from class_free_guide.supervisor.llm_client import build_client
 
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -332,3 +397,143 @@ def test_openrouter_missing_key_raises(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="No API key found"):
         build_client(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Early stopping tests (via from_rl_env)
+# ---------------------------------------------------------------------------
+
+
+def test_early_stop_triggers_when_score_high(tmp_path, monkeypatch):
+    """When score >= pass_score and iter >= min_training_iters, event is set."""
+    patch = {"action_rate_l2": -0.04}
+    sup, _env, stopping_event = _make_supervisor_for_early_stop(
+        tmp_path,
+        patch,
+        score=85,
+        pass_score=75.0,
+        min_training_iters=50,
+        current_iter=100,
+    )
+
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    sup._run_cycle()
+
+    assert stopping_event.is_set()
+    assert (tmp_path / "supervisor" / "EARLY_STOP").exists()
+    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().strip().split("\n\n")
+    assert any(json.loads(block)["kind"] == "early_stop" for block in audit)
+
+
+def test_early_stop_blocked_below_min_iters(tmp_path, monkeypatch):
+    """Early stop does NOT trigger when current_iter < min_training_iters."""
+    patch = {"action_rate_l2": -0.04}
+    sup, _env, stopping_event = _make_supervisor_for_early_stop(
+        tmp_path,
+        patch,
+        score=85,
+        pass_score=75.0,
+        min_training_iters=500,
+        current_iter=100,
+    )
+
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    sup._run_cycle()
+
+    assert not stopping_event.is_set()
+    assert not (tmp_path / "supervisor" / "EARLY_STOP").exists()
+
+
+def test_early_stop_blocked_by_low_score(tmp_path, monkeypatch):
+    """Early stop does NOT trigger when score < pass_score."""
+    patch = {"action_rate_l2": -0.04}
+    sup, _env, stopping_event = _make_supervisor_for_early_stop(
+        tmp_path,
+        patch,
+        score=30,
+        pass_score=75.0,
+        min_training_iters=50,
+        current_iter=500,
+    )
+
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    sup._run_cycle()
+
+    assert not stopping_event.is_set()
+    assert not (tmp_path / "supervisor" / "EARLY_STOP").exists()
+
+
+def test_early_stop_disabled_by_config(tmp_path, monkeypatch):
+    """When early_stopping=False, no early stop even with high score."""
+    patch = {"action_rate_l2": -0.04}
+    sup, _env, stopping_event = _make_supervisor_for_early_stop(
+        tmp_path,
+        patch,
+        score=90,
+        early_stopping=False,
+        pass_score=75.0,
+        min_training_iters=50,
+        current_iter=500,
+    )
+
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    sup._run_cycle()
+
+    assert not stopping_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Framework-agnostic callback constructor test
+# ---------------------------------------------------------------------------
+
+
+def test_callback_constructor_without_env(tmp_path):
+    """Supervisor works with raw callbacks — no env, no RL machinery."""
+    params = {
+        "track_linear_velocity": 1.0,
+        "action_rate_l2": -0.05,
+        "foot_slip": -0.25,
+    }
+
+    callbacks = SupervisorCallbacks(
+        metrics_getter=_seed_snapshot,
+        frames_getter=lambda overlay=None: [],
+        params_getter=lambda: dict(params),
+        param_setter=lambda n, v: params.__setitem__(n, v),
+        known_params_getter=lambda: list(params.keys()),
+    )
+
+    cfg = SupervisorConfig(
+        interval_min=60.0,
+        cooldown_iters=0,
+        warmup_iters=0,
+        max_patch_fields=3,
+        max_rel_change=0.30,
+        provider="stub",
+    )
+    sup = Supervisor(
+        log_dir=tmp_path,
+        config=cfg,
+        callbacks=callbacks,
+        llm=ScriptedClient({"action_rate_l2": -0.04}),
+        iter_getter=lambda: 100,
+    )
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    sup._run_cycle()
+
+    # Patch applied to the plain dict (no reward_manager involved).
+    assert params["action_rate_l2"] == pytest.approx(-0.04)
+
+    v1 = tmp_path / "reward_cfg" / "v01.yaml"
+    assert v1.exists()
+
+    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().strip().split("\n\n")
+    assert any(json.loads(block)["kind"] == "applied" for block in audit)

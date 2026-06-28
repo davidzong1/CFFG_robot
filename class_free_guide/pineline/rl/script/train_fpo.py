@@ -23,10 +23,20 @@ import logging
 import os
 import random
 import sys
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
+
+# ---------------------------------------------------------------------------
+# Headless rendering: MUST set MUJOCO_GL BEFORE any MuJoCo import.
+# MuJoCo loads the GL backend at import time; setting the env var after
+# imports have already completed has no effect and GLFW will fail when
+# no X11 display is available.
+# ---------------------------------------------------------------------------
+if "--headless" in sys.argv:
+    os.environ["MUJOCO_GL"] = "egl"
 
 import tyro
 
@@ -106,7 +116,7 @@ class FpoTrainConfig:
     log_project_name: str | None = None
     # TensorBoard local broadcasting: when set, starts a TensorBoard server
     # on this port binding to 0.0.0.0 so remote devices can monitor training.
-    tb_port: int = 114514
+    tb_port: int = 11451
     # LLM-driven reward-weight supervisor (rank 0, single-GPU runs only).
     supervisor: bool = False
     supervisor_config: str | None = None
@@ -266,11 +276,9 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
 
     _start_tensorboard_server(str(log_dir.parent), cfg.tb_port)
 
-    # headless overrides video
-    if cfg.headless:
-        cfg.video = False
-
-    # Create mjlab environment
+    # Create mjlab environment.
+    # EGL backend supports offscreen rendering; video recording works
+    # in headless mode as long as MUJOCO_GL=egl is set before import.
     render_mode = "rgb_array" if cfg.video else None
     env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode=render_mode)
 
@@ -311,11 +319,10 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
 
     # Optional LLM reward supervisor (rank 0 only).
     supervisor = None
+    is_supervisor = cfg.supervisor
     if cfg.supervisor and rank == 0:
-        if cfg.headless:
-            raise ValueError("[ ERROR ] When using LLM automatic parameter tuning, the headless mode cannot be activated!")
         try:
-            from class_free_guide.pineline.rl.supervisor import (
+            from class_free_guide.supervisor import (
                 Supervisor,
                 SupervisorConfig,
             )
@@ -325,15 +332,18 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
             # CLI --objective overrides whatever the supervisor yaml said.
             if cfg.objective:
                 sup_cfg.objective_path = cfg.objective
-            supervisor = Supervisor(
+            stopping_event = threading.Event()
+            supervisor = Supervisor.from_rl_env(
                 env=env,
                 writer=None,
                 log_dir=log_dir,
                 config=sup_cfg,
                 writer_getter=lambda: getattr(runner, "writer", None),
                 iter_getter=lambda: int(getattr(runner, "current_learning_iteration", 0)),
+                stopping_event=stopping_event,
             )
             supervisor.start()
+            runner.early_stop_event = stopping_event
             print(
                 f"[INFO] Reward supervisor enabled "
                 f"(provider={sup_cfg.provider}, interval={sup_cfg.interval_min:.0f}min, "
@@ -344,8 +354,9 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
             supervisor = None
 
     # Determine number of training iterations
-    num_learning_iterations = cfg.agent.max_iterations
-    print(f"[INFO] Training for {num_learning_iterations} iterations (max_iterations={cfg.agent.max_iterations})")
+    real_max_iterations = cfg.agent.max_iterations if not is_supervisor else 10000000
+    num_learning_iterations = real_max_iterations
+    print(f"[INFO] Training for {num_learning_iterations} iterations (max_iterations={real_max_iterations})")
 
     # Run training
     try:
@@ -430,6 +441,8 @@ def launch_fpo_training(task_id: str, args: FpoTrainConfig | None = None):
         # Disable the viewer in env config if present
         if hasattr(args.env, "viewer") and args.env.viewer is not None:
             args.env.viewer = None
+        # Disable video recording — OffscreenRenderer requires a viewer config.
+        object.__setattr__(args, "video", False)
         print("[INFO] Headless mode enabled: MuJoCo GL backend set to EGL, viewer disabled.")
 
     if num_gpus <= 1:

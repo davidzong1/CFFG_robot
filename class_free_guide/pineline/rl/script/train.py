@@ -4,11 +4,22 @@ import ast
 import logging
 import os
 import random
+import signal
 import sys
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
+
+# ---------------------------------------------------------------------------
+# Headless rendering: MUST set MUJOCO_GL BEFORE any MuJoCo import.
+# MuJoCo loads the GL backend at import time; setting the env var after
+# imports have already completed has no effect and GLFW will fail when
+# no X11 display is available.
+# ---------------------------------------------------------------------------
+if "--headless" in sys.argv:
+    os.environ["MUJOCO_GL"] = "egl"
 
 import tyro
 
@@ -47,7 +58,7 @@ class TrainConfig:
     log_project_name: str | None = None
     # TensorBoard local broadcasting: when set, starts a TensorBoard server
     # on this port binding to 0.0.0.0 so remote devices can monitor training.
-    tb_port: int = 114514
+    tb_port: int = 11451
     # LLM-driven reward-weight supervisor (rank 0, single-GPU runs only).
     supervisor: bool = False
     supervisor_config: str | None = None
@@ -213,11 +224,9 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
     _start_tensorboard_server(str(log_dir.parent), cfg.tb_port)
 
-    # headless overrides video
-    if cfg.headless:
-        cfg.video = False
-
-    # Create mjlab environment
+    # Create mjlab environment.
+    # EGL backend supports offscreen rendering; video recording works
+    # in headless mode as long as MUJOCO_GL=egl is set before import.
     render_mode = "rgb_array" if cfg.video else None
     env = ManagerBasedRlEnv(cfg=cfg.env, device=device, render_mode=render_mode)
 
@@ -263,11 +272,10 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
     # Optional LLM reward supervisor (rank 0 only).
     supervisor = None
+    is_supervisor = cfg.supervisor
     if cfg.supervisor and rank == 0:
-        if cfg.headless:
-            raise ValueError("[ ERROR ] When using LLM automatic parameter tuning, the headless mode cannot be activated!")
         try:
-            from class_free_guide.pineline.rl.supervisor import (
+            from class_free_guide.supervisor import (
                 Supervisor,
                 SupervisorConfig,
             )
@@ -277,15 +285,27 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
             # CLI --objective overrides whatever the supervisor yaml said.
             if cfg.objective:
                 sup_cfg.objective_path = cfg.objective
-            supervisor = Supervisor(
+            stopping_event = threading.Event()
+            supervisor = Supervisor.from_rl_env(
                 env=env,
                 writer=None,
                 log_dir=log_dir,
                 config=sup_cfg,
                 writer_getter=lambda: getattr(runner, "writer", None),
                 iter_getter=lambda: int(getattr(runner, "current_learning_iteration", 0)),
+                stopping_event=stopping_event,
             )
             supervisor.start()
+
+            # Monitor thread: when the supervisor sets stopping_event, send
+            # SIGINT to interrupt the blocking runner.learn() call.  The
+            # existing try/finally block ensures clean teardown.
+            def _early_stop_monitor() -> None:
+                stopping_event.wait()
+                os.kill(os.getpid(), signal.SIGINT)
+
+            threading.Thread(target=_early_stop_monitor, daemon=True).start()
+
             print(
                 f"[INFO] Reward supervisor enabled "
                 f"(provider={sup_cfg.provider}, interval={sup_cfg.interval_min:.0f}min, "
@@ -295,8 +315,12 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
             print(f"[WARN] Failed to start reward supervisor: {e}")
             supervisor = None
 
+    real_max_iterations = cfg.agent.max_iterations if not is_supervisor else 10000000
+    num_learning_iterations = real_max_iterations
+    print(f"[INFO] Training for {num_learning_iterations} iterations (max_iterations={real_max_iterations})")
+
     try:
-        runner.learn(num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True)
+        runner.learn(num_learning_iterations=real_max_iterations, init_at_random_ep_len=True)
     finally:
         if supervisor is not None:
             supervisor.stop()

@@ -1,0 +1,3 @@
+[submodule "threeparty/cpp_ipc_dds"]
+	path = threeparty/cpp_ipc_dds
+	url = https://github.com/davidzong1/Cpp-IPC-DDS.git

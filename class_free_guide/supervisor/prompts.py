@@ -27,7 +27,12 @@ You MUST reply with a single JSON object matching this shape:
 {
   "observations": ["..."],   // 2-6 concrete observations from data/video
   "hypotheses":   ["..."],   // 1-4 hypotheses about why training is suboptimal
-  "confidence":   0.0        // float in [0, 1]
+  "confidence":   0.0,       // float in [0, 1]
+  "score":        0          // integer 0-100: how well the policy currently meets the
+                             // TRAINING OBJECTIVE. 0 = completely untrained,
+                             // 100 = perfectly satisfies the objective. Consider all
+                             // priorities and avoid-list items from the objective
+                             // block. Be honest and conservative — never inflate.
 }
 
 Do not write anything outside the JSON object.

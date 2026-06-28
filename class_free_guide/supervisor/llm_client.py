@@ -56,6 +56,18 @@ def build_client(cfg: SupervisorConfig) -> LLMClient:
     raise ValueError(f"Unknown LLM provider: {cfg.provider}")
 
 
+def _resolve_api_key(cfg: SupervisorConfig, *fallback_envs: str) -> str:
+    """Resolve API key: cfg.api_key (inline) > cfg.api_key_env (env var) > fallbacks."""
+    if cfg.api_key:
+        return cfg.api_key
+    for env_name in (cfg.api_key_env, *fallback_envs):
+        key = os.environ.get(env_name)
+        if key:
+            return key
+    tried = ["cfg.api_key"] + [cfg.api_key_env] + list(fallback_envs)
+    raise RuntimeError(f"No API key found. Tried: {', '.join(tried)}")
+
+
 # ---------------------------------------------------------------------------
 # Anthropic Claude
 # ---------------------------------------------------------------------------
@@ -69,11 +81,7 @@ class ClaudeClient(LLMClient):
             raise RuntimeError(
                 "anthropic SDK not installed; pip install anthropic"
             ) from e
-        api_key = os.environ.get(cfg.api_key_env)
-        if not api_key:
-            raise RuntimeError(
-                f"environment variable {cfg.api_key_env} is not set"
-            )
+        api_key = _resolve_api_key(cfg)
         self._client = anthropic.Anthropic(api_key=api_key)
         self.cfg = cfg
 
@@ -161,11 +169,7 @@ class OpenAIClient(LLMClient):
             import openai
         except ImportError as e:  # pragma: no cover
             raise RuntimeError("openai SDK not installed; pip install openai") from e
-        api_key = os.environ.get(cfg.api_key_env) or os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                f"environment variable {cfg.api_key_env} (or OPENAI_API_KEY) is not set"
-            )
+        api_key = _resolve_api_key(cfg, "OPENAI_API_KEY")
         kwargs: dict[str, Any] = {"api_key": api_key}
         if cfg.api_base:
             kwargs["base_url"] = cfg.api_base
@@ -271,20 +275,7 @@ class OpenRouterClient(OpenAIClient):
             raise RuntimeError("openai SDK not installed; pip install openai") from e
 
         # ---- api_key -------------------------------------------------------
-        api_key = os.environ.get(cfg.api_key_env)
-        if not api_key:
-            # Try a few common fallbacks so the user doesn't need to set
-            # api_key_env explicitly for every provider.
-            for fallback in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
-                api_key = os.environ.get(fallback)
-                if api_key:
-                    break
-        if not api_key:
-            raise RuntimeError(
-                f"No API key found. Tried env vars: {cfg.api_key_env}, "
-                f"OPENROUTER_API_KEY, OPENAI_API_KEY. "
-                f"Set one of them or change api_key_env in your supervisor yaml."
-            )
+        api_key = _resolve_api_key(cfg, "OPENROUTER_API_KEY", "OPENAI_API_KEY")
 
         # ---- base_url -------------------------------------------------------
         if not cfg.api_base:
@@ -326,6 +317,7 @@ class StubClient(LLMClient):
             "observations": ["stub: no analysis performed"],
             "hypotheses": [],
             "confidence": 0.0,
+            "score": 0,
         }
 
     def propose(self, diagnose_result, schema_summary, current_weights, objective_block=None):

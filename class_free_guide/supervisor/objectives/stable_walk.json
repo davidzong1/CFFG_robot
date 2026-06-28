@@ -12,5 +12,6 @@
     "Trading away tracking_lin_vel weight to chase shaping rewards",
     "Reward hacking via foot_gait while ignoring orientation"
   ],
-  "notes": "If you must choose between stability and tracking accuracy, choose stability."
+  "notes": "If you must choose between stability and tracking accuracy, choose stability.",
+  "reference_frame": "class_free_guide/pineline/rl/supervisor/reference/go2/go2_walk.png(ps:The reference frame represents the optimal posture of the quadruped robot when its speed is zero. When it has a walking speed, while ensuring stability, the body should produce regular foot swinging)"
 }

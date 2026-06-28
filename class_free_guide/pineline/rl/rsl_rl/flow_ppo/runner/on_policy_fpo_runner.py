@@ -6,14 +6,13 @@
 from __future__ import annotations
 
 import os
-import statistics
 import time
 import torch
-from collections import deque
 
 from typing import TYPE_CHECKING
 
 from ..alg.flow_ppo_fpo import FPO
+from ..utils.logger import Logger
 import class_free_guide
 
 if TYPE_CHECKING:
@@ -23,7 +22,6 @@ from ..module.actor_critic_fpo import (
     ActorCritic,
 )
 from rsl_rl.modules import EmpiricalNormalization
-from ..utils.utils import store_code_state
 
 
 class OnPolicyRunner:
@@ -96,19 +94,21 @@ class OnPolicyRunner:
             [self.env.num_actions],
         )
 
-        # Decide whether to disable logging
-        # We only log from the process with rank 0 (main process)
-        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
-        # Logging
-        self.log_dir = log_dir
-        self.writer = None
-        self.tot_timesteps = 0
-        self.tot_time = 0
+        # Logger — handles all writer/console/buffer management
+        self.logger = Logger(
+            log_dir=log_dir,
+            cfg=train_cfg,
+            env_cfg=None,
+            num_envs=self.env.num_envs,
+            is_distributed=self.is_distributed,
+            gpu_world_size=self.gpu_world_size,
+            gpu_global_rank=self.gpu_global_rank,
+            device=self.device,
+            git_status_repos=[class_free_guide.__file__, __file__],
+            num_steps_per_env=train_cfg.num_steps_per_env,
+        )
         self.current_learning_iteration = 0
-        self.git_status_repos = [
-            class_free_guide.__file__,
-            __file__,
-        ]  # log the git status of the main repository and the current file's repository (in case they are different)
+        self.early_stop_event = None  # threading.Event, set by supervisor when training should stop
 
     @staticmethod
     def _process_obs_ret(obs_ret):
@@ -145,31 +145,23 @@ class OnPolicyRunner:
         return obs, extras
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
-        # initialize writer
-        if self.log_dir is not None and self.writer is None and not self.disable_logs:
-            # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
-            self.logger_type = getattr(self.cfg, "logger", "tensorboard")
-            self.logger_type = self.logger_type.lower()
-
-            if self.logger_type == "tensorboard":
-                from torch.utils.tensorboard import SummaryWriter
-
-                self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
-            else:
-                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
-
-            # Define custom WandB metrics for post-training eval
-            if self.logger_type == "wandb" and self.enable_post_training_eval:
+        # Define wandb metrics callback for post-training eval
+        def _define_wandb_metrics():
+            if self.enable_post_training_eval:
                 import wandb
 
                 wandb.define_metric("eval_iteration")
-                # Define metrics for each eval mode
                 eval_modes = getattr(self.cfg, "flow_eval_modes", ["zero", "fixed_seed", "random"])
                 for mode in eval_modes:
                     wandb.define_metric(f"PostEval_{mode}/mean_reward", step_metric="eval_iteration")
                     wandb.define_metric(f"PostEval_{mode}/std_reward", step_metric="eval_iteration")
                     wandb.define_metric(f"PostEval_{mode}/mean_episode_length", step_metric="eval_iteration")
                     wandb.define_metric(f"PostEval_{mode}/std_episode_length", step_metric="eval_iteration")
+
+        # Initialize logging writer (Tensorboard / W&B / Neptune)
+        self.logger.init_logging_writer(
+            wandb_define_metrics_callback=_define_wandb_metrics,
+        )
 
         # randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
@@ -182,14 +174,8 @@ class OnPolicyRunner:
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
-        # Book keeping
-        ep_infos = []
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        # Book keeping — Logger manages reward/episode buffers internally
+        # via process_env_step().
 
         # Ensure all parameters are in-synced
         if self.is_distributed:
@@ -202,6 +188,11 @@ class OnPolicyRunner:
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
+            # Check for supervisor-issued early stop signal.
+            if self.early_stop_event is not None and self.early_stop_event.is_set():
+                print(f"[FPO runner] Early stop at iteration {it}. Score threshold met by supervisor.")
+                break
+
             start = time.perf_counter()
             # Initialize timing accumulators
             env_step_time = 0.0
@@ -253,23 +244,8 @@ class OnPolicyRunner:
                     self.alg.process_env_step(rewards, dones, infos)
                     process_time += time.perf_counter() - process_start
 
-                    # book keeping
-                    if self.log_dir is not None:
-                        if "episode" in infos:
-                            ep_infos.append(infos["episode"])
-                        elif "log" in infos:
-                            ep_infos.append(infos["log"])
-                        # Update rewards
-                        cur_reward_sum += rewards
-                        # Update episode length
-                        cur_episode_length += 1
-                        # Clear data for completed episodes
-                        # -- common
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
+                    # book keeping — delegate to Logger
+                    self.logger.process_env_step(rewards, dones, infos)
 
                 stop = time.perf_counter()
                 collection_time = stop - start
@@ -299,169 +275,37 @@ class OnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
             # log info
-            if self.log_dir is not None and not self.disable_logs:
-                # Log information
-                self.log(locals())
+            if self.logger.writer is not None:
+                self.logger.log(
+                    it=it,
+                    start_it=start_iter,
+                    total_it=tot_iter,
+                    collect_time=collection_time,
+                    learn_time=learn_time,
+                    loss_dict=loss_dict,
+                    learning_rate=self.alg.learning_rate,
+                    timing_details={
+                        "env_step_time": env_step_time,
+                        "action_time": action_time,
+                        "process_time": process_time,
+                        "simulation_time": simulation_time,
+                    },
+                )
 
                 # Save model
                 if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
-
-            # Clear episode infos
-            ep_infos.clear()
-            # Save code state
-            if it == start_iter and not self.disable_logs:
-                # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
+                    self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))
 
         # Save the final model after training
-        if self.log_dir is not None and not self.disable_logs:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        if self.logger.writer is not None:
+            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
         # Run post-training checkpoint evaluation
-        if self.log_dir is not None and not self.disable_logs:
+        if self.logger.writer is not None:
             self.run_post_training_checkpoint_eval()
 
-        # Properly close the writer to ensure all metrics are flushed
-        if self.writer is not None:
-            if hasattr(self.writer, "stop"):
-                self.writer.stop()
-            if hasattr(self.writer, "close"):
-                self.writer.close()
-
-    def log(self, locs: dict, width: int = 80, pad: int = 35):
-        # Compute the collection size
-        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
-        # Update total time-steps and time
-        self.tot_timesteps += collection_size
-        self.tot_time += locs["collection_time"] + locs["learn_time"]
-        iteration_time = locs["collection_time"] + locs["learn_time"]
-
-        # -- Episode info
-        ep_string = ""
-        if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs["ep_infos"]:
-                    # handle scalar and zero dimensional tensor infos
-                    if key not in ep_info:
-                        continue
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                # log to logger and terminal
-                if "/" in key:
-                    self.writer.add_scalar(key, value, locs["it"])
-                    ep_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-                else:
-                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
-                    ep_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
-
-        fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
-
-        # -- Losses
-        for key, value in locs["loss_dict"].items():
-            if key == "metrics":
-                # Handle metrics dict (non-loss metrics like clip_param, grad norms, etc.)
-                for metric_name, metric_value in value.items():
-                    self.writer.add_scalar(f"Metrics/{metric_name}", metric_value, locs["it"])
-            else:
-                self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
-        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
-
-        # -- Performance
-        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
-        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
-
-        # -- Detailed timing breakdown
-        if "env_step_time" in locs:
-            self.writer.add_scalar("Perf/env_step_time", locs["env_step_time"], locs["it"])
-            self.writer.add_scalar("Perf/action_time", locs["action_time"], locs["it"])
-            self.writer.add_scalar("Perf/process_time", locs["process_time"], locs["it"])
-            self.writer.add_scalar("Perf/simulation_time", locs["simulation_time"], locs["it"])
-
-            # Calculate percentages
-            total_time = locs["collection_time"] + locs["learn_time"]
-            sim_percentage = (locs["simulation_time"] / total_time) * 100 if total_time > 0 else 0
-            opt_percentage = (locs["learn_time"] / total_time) * 100 if total_time > 0 else 0
-
-            self.writer.add_scalar("Perf/simulation_percentage", sim_percentage, locs["it"])
-            self.writer.add_scalar("Perf/optimization_percentage", opt_percentage, locs["it"])
-
-        # -- Training
-        if len(locs["rewbuffer"]) > 0:
-            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-            self.writer.add_scalar(
-                "Train/mean_episode_length",
-                statistics.mean(locs["lenbuffer"]),
-                locs["it"],
-            )
-            if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
-                self.writer.add_scalar(
-                    "Train/mean_reward/time",
-                    statistics.mean(locs["rewbuffer"]),
-                    self.tot_time,
-                )
-                self.writer.add_scalar(
-                    "Train/mean_episode_length/time",
-                    statistics.mean(locs["lenbuffer"]),
-                    self.tot_time,
-                )
-
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
-
-        if len(locs["rewbuffer"]) > 0:
-            log_string = f"""{"#" * width}\n""" f"""{str.center(width, " ")}\n\n""" f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {
-                    locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-            # -- Losses
-            for key, value in locs["loss_dict"].items():
-                # Skip non-scalar values (like histograms)
-                if isinstance(value, (int, float)):
-                    log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
-            # -- Rewards
-            log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
-            # -- episode info
-            log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
-        else:
-            log_string = f"""{"#" * width}\n""" f"""{str.center(width, " ")}\n\n""" f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {
-                    locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-            for key, value in locs["loss_dict"].items():
-                # Skip non-scalar values (like histograms)
-                if isinstance(value, (int, float)):
-                    log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-
-        log_string += ep_string
-        log_string += (
-            f"""{"-" * width}\n"""
-            f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
-            f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-            f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-            f"""{"ETA:":>{pad}} {
-                time.strftime(
-                    "%H:%M:%S",
-                    time.gmtime(
-                        self.tot_time
-                        / (locs["it"] - locs["start_iter"] + 1)
-                        * (
-                            locs["start_iter"]
-                            + locs["num_learning_iterations"]
-                            - locs["it"]
-                        )
-                    ),
-                )
-            }\n"""
-        )
-        print(log_string)
+        # Properly close the writer
+        self.logger.stop_logging_writer()
 
     def save(self, path: str, infos=None):
         # -- Prepare model state dict (use EMA if available)
@@ -496,8 +340,7 @@ class OnPolicyRunner:
         torch.save(saved_dict, path)
 
         # upload model to external logging service
-        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
-            self.writer.save_model(path, self.current_learning_iteration)
+        self.logger.save_model(path, self.current_learning_iteration)
 
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
@@ -574,11 +417,11 @@ class OnPolicyRunner:
         import glob
         import re
 
-        if self.log_dir is None:
+        if self.logger.log_dir is None:
             return []
 
         # Find all checkpoint files
-        checkpoint_pattern = os.path.join(self.log_dir, "model_*.pt")
+        checkpoint_pattern = os.path.join(self.logger.log_dir, "model_*.pt")
         checkpoint_files = glob.glob(checkpoint_pattern)
 
         # Parse iteration numbers from filenames
@@ -755,11 +598,11 @@ class OnPolicyRunner:
         if not self.enable_post_training_eval:
             return
 
-        if self.disable_logs:
+        if self.logger.disable_logs:
             print("[INFO] Skipping post-training eval on non-main rank in distributed training")
             return
 
-        if self.writer is None:
+        if self.logger.writer is None:
             print("[WARNING] No writer available, skipping post-training eval")
             return
 
@@ -797,7 +640,7 @@ class OnPolicyRunner:
             all_results[iteration] = eval_results
 
             # Log to wandb with custom x-axis
-            if self.logger_type == "wandb":
+            if self.logger.logger_type == "wandb":
                 try:
                     import wandb
 
@@ -814,10 +657,10 @@ class OnPolicyRunner:
             else:
                 # For tensorboard/neptune, use regular writer (they don't have the step ordering issue)
                 for mode, results in eval_results.items():
-                    self.writer.add_scalar(f"PostEval_{mode}/mean_reward", results["mean_reward"], iteration)
-                    self.writer.add_scalar(f"PostEval_{mode}/std_reward", results["std_reward"], iteration)
-                    self.writer.add_scalar(f"PostEval_{mode}/mean_episode_length", results["mean_length"], iteration)
-                    self.writer.add_scalar(f"PostEval_{mode}/std_episode_length", results["std_length"], iteration)
+                    self.logger.writer.add_scalar(f"PostEval_{mode}/mean_reward", results["mean_reward"], iteration)
+                    self.logger.writer.add_scalar(f"PostEval_{mode}/std_reward", results["std_reward"], iteration)
+                    self.logger.writer.add_scalar(f"PostEval_{mode}/mean_episode_length", results["mean_length"], iteration)
+                    self.logger.writer.add_scalar(f"PostEval_{mode}/std_episode_length", results["std_length"], iteration)
 
             # Print results for this checkpoint
             for mode, results in eval_results.items():
@@ -833,7 +676,7 @@ class OnPolicyRunner:
         print("=" * 80 + "\n")
 
     def add_git_repo_to_log(self, repo_file_path):
-        self.git_status_repos.append(repo_file_path)
+        self.logger.git_status_repos.append(repo_file_path)
 
     """
     Helper functions.

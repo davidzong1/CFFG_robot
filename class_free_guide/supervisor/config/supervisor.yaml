@@ -9,6 +9,13 @@ max_patch_fields: 3          # at most this many terms modified per cycle
 max_rel_change: 0.30         # |new-old|/|old| per cycle per term
 max_consecutive_rollbacks: 2 # blacklist a term after this many rollbacks
 
+# ---- Early stopping ---------------------------------------------------------
+# The supervisor scores the model (0-100) during each diagnosis cycle.
+# Training is halted when score >= pass_score AND current_iter >= min_training_iters.
+early_stopping: true
+pass_score: 75.0
+min_training_iters: 10000
+
 metric_window: 200
 metric_downsample: 50
 clips_per_cycle: 2
@@ -43,12 +50,19 @@ video_frames_per_clip: 6
 # stub:
 #   No API key needed. Returns empty patches — for offline tests only.
 # ----------------------------------------------------------------------------
-provider: anthropic
+provider: anthropic # Any router mode both select openrouter and set api_base to the router's endpoint!!!!!!!
 model: claude-opus-4-7
 max_tokens: 2048
-temperature: 0.3
+temperature: 0.3 # dont change
 api_base: null
-api_key_env: ANTHROPIC_API_KEY
+# API key: set either ``api_key`` (inline key in this file) or ``api_key_env``
+# (name of an environment variable).  ``api_key`` takes precedence.
+
+# !!!!!!!!!!!(2 choose 1) If both are null, the supervisor will fail to start.!!!!!!!!!!!!
+# api_key: "sk-..." 
+# api_key_env: ANTHROPIC_API_KEY
+
+
 # Extra HTTP headers forwarded to the LLM API (useful for OpenRouter
 # ranking signals, auth proxies, etc.).  Ignored for provider=anthropic.
 extra_headers: {}

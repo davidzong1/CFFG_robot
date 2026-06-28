@@ -8,10 +8,13 @@ process. It periodically:
   3. Asks an LLM to diagnose and propose a reward-weight patch.
   4. Validates the patch (schema + bounds + cooldown + killswitch).
   5. Writes the patch atomically and mutates the live ``RewardManager``.
+
+Use ``SupervisorCallbacks`` to wire the supervisor into non-RL frameworks.
 """
 
 from .config import SupervisorConfig
+from .interfaces import SupervisorCallbacks
 from .objective import TrainingObjective
 from .supervisor import Supervisor
 
-__all__ = ["Supervisor", "SupervisorConfig", "TrainingObjective"]
+__all__ = ["Supervisor", "SupervisorCallbacks", "SupervisorConfig", "TrainingObjective"]

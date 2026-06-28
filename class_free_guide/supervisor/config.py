@@ -23,6 +23,12 @@ class SupervisorConfig:
     max_rel_change: float = 0.30
     max_consecutive_rollbacks: int = 2
 
+    # Early stopping: the supervisor scores the model each cycle and can
+    # halt training when the policy is good enough.
+    early_stopping: bool = True       # master enable/disable
+    pass_score: float = 75.0          # score threshold (0-100)
+    min_training_iters: int = 1000    # min iters before early stop is allowed
+
     # Data shipped to the LLM
     metric_window: int = 200  # last-N TB points considered
     metric_downsample: int = 50  # points kept after downsampling
@@ -35,6 +41,7 @@ class SupervisorConfig:
     max_tokens: int = 2048
     temperature: float = 0.3
     api_base: str | None = None   # base URL for openai / openrouter / any compatible API
+    api_key: str | None = None   # inline key (takes precedence over api_key_env)
     api_key_env: str = "ANTHROPIC_API_KEY"
     # Extra HTTP headers injected into every LLM request (useful for OpenRouter,
     # self-hosted gateways, etc.).  Example:
