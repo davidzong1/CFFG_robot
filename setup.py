@@ -11,7 +11,7 @@ with open(path.join(here, "requirements.txt"), encoding="utf-8") as f:
         requires_list.append(line)
 
 # Git-based dependencies not in requirements.txt can be appended here.
-requires_list.append("muon @ git+https://github.com/KellerJordan/Muon.git")
+#requires_list.append("muon @ git+https://github.com/KellerJordan/Muon.git")
 
 
 setup(

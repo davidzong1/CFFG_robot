@@ -16,10 +16,18 @@ from .llm_client import LLMClient, build_client
 from .objective import TrainingObjective
 from .patcher import RewardPatcher
 from .rollback import RollbackEvaluator
+from .safety import SafetyConfig, SafetyMonitor
 from .schema import RewardSchema
 import dzipc
 
 log = logging.getLogger(__name__)
+
+
+def _is_fatal_error(exc: BaseException) -> bool:
+    """Return True for errors that will never heal by retrying
+    (e.g. non-vision model, invalid API key)."""
+    msg = str(exc).lower()
+    return "vision-capable" in msg or "image_url" in msg
 
 
 class Supervisor:
@@ -103,6 +111,14 @@ class Supervisor:
         # ---- guardrails & rollback ------------------------------------------
         self.guardrails = Guardrails(self.schema, config, self.log_dir)
         self.rollback = RollbackEvaluator(self.patcher, self.guardrails)
+
+        # ---- safety monitor -------------------------------------------------
+        safety_cfg = SafetyConfig.from_dict(config.safety)
+        self.safety = SafetyMonitor(
+            log_dir,
+            safety_cfg,
+            audit_writer=self._write_audit,
+        )
 
         # ---- threading ------------------------------------------------------
         self._stop = threading.Event()
@@ -242,13 +258,30 @@ class Supervisor:
                     update_time="error",
                     additional_info=json.dumps({"event": "cycle_error", "error": repr(exc)}),
                 )
+                # Fatal errors (e.g. non-vision model) must stop training
+                # so GPU hours are not wasted on a supervisor that can never work.
+                if _is_fatal_error(exc):
+                    log.critical(
+                        "[supervisor] FATAL error — signalling training to stop. %s",
+                        exc,
+                    )
+                    self._stop.set()
+                    if self._stopping_event is not None:
+                        self._stopping_event.set()
+                    return  # exit the daemon loop immediately
             # Schedule next cycle; heartbeat reads _next_cycle_at.
             self._next_cycle_at = time.time() + min_to_sec
-            # Sleep in small chunks so stop() returns promptly.
+            # Sleep in small chunks so stop() returns promptly, interleaving
+            # safety checks at the configured cadence.
+            safety_interval = min(self.safety.config.check_interval_s, min_to_sec)
             slept = 0.0
             while slept < min_to_sec and not self._stop.is_set():
-                time.sleep(min(60.0, min_to_sec - slept))
-                slept += 60.0
+                # Run safety checks at configured cadence
+                if self.safety.config.enabled:
+                    self._run_safety_check()
+                sleep_chunk = min(safety_interval, min_to_sec - slept)
+                self._stop.wait(timeout=sleep_chunk)
+                slept += sleep_chunk
 
     def _check_completion(self, diag: dict[str, Any], current_iter: int) -> None:
         """If the LLM-assigned score meets the pass threshold and we've trained
@@ -281,6 +314,25 @@ class Supervisor:
         if self._stopping_event is not None:
             self._stopping_event.set()
 
+    def _run_safety_check(self) -> bool:
+        """Run programmatic safety checks against TB scalars.
+
+        Returns True if a stop action was triggered (caller should abort
+        the current LLM cycle).
+        """
+        if not self.safety.config.enabled:
+            return False
+        try:
+            current_iter = self._iter_getter()
+            violations = self.safety.check(current_iter)
+            for v in violations:
+                self.safety.execute(v, self)
+                if v.threshold.action == "stop":
+                    return True
+        except Exception:
+            log.exception("[supervisor] safety check failed")
+        return False
+
     def _run_cycle(self) -> None:
         if self.guardrails.killswitch_present():
             self._write_audit({"kind": "paused"})
@@ -288,6 +340,11 @@ class Supervisor:
                 update_time="paused",
                 additional_info=json.dumps({"event": "paused"}),
             )
+            return
+
+        # Run safety checks before the LLM cycle — stop/rollback take priority
+        # over LLM diagnosis.
+        if self._run_safety_check():
             return
 
         current_iter = self._iter_getter()
@@ -305,6 +362,7 @@ class Supervisor:
         frames = self._callbacks.frames_getter(overlay={"iter": str(current_iter), "v": str(self.patcher.version)})
 
         # ---- LLM diagnose ---------------------------------------------------
+        t0 = time.monotonic()
         diag = self.llm.diagnose(
             snapshot_summary,
             current_weights,
@@ -324,6 +382,7 @@ class Supervisor:
             current_weights,
             objective_block=self.objective.to_prompt_block(),
         )
+        thinking_time = time.monotonic() - t0
 
         # ---- validate & apply -----------------------------------------------
         guard = self.guardrails.evaluate(proposal, current_weights, current_iter)
@@ -354,6 +413,7 @@ class Supervisor:
             rollback_if=str(proposal.get("rollback_if", "")),
             diagnose=diag,
             current_iter=current_iter,
+            thinking_time=thinking_time,
         )
         self.guardrails.note_apply(current_iter)
         if record.rollback_if:

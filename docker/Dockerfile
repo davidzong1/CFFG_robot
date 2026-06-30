@@ -17,7 +17,7 @@ RUN apt-get update  && \
     apt-get install -y --no-install-recommends \
     sudo vim git \
     && apt-get install -y gnome-terminal \
-    dbus-x11 \
+    dbus-x11 cmake make xclip tmux \
     libcanberra-gtk-module \ 
     libcanberra-gtk3-module wget curl \
 # other tools
@@ -28,7 +28,7 @@ RUN apt-get update  && \
     && apt install -y software-properties-common \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt update -y \
-    && apt install -y python3.11 python3.11-distutils python3.11-dev python3-pip \
+    && apt install -y python3.11 python3.11-distutils python3.11-dev python3-pip pybind11-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
     && rm -rf /var/lib/apt/lists/*
 

@@ -75,6 +75,8 @@ class RewardPatcher:
         rollback_if: str,
         diagnose: dict[str, Any],
         current_iter: int,
+        *,
+        thinking_time: float | None = None,
     ) -> AppliedPatch:
         before = {k: self.weight_getter(k) for k in patch.keys()}
         for name, new_val in patch.items():
@@ -84,16 +86,19 @@ class RewardPatcher:
 
         # Persist all weights for replay/rollback, not just the diff.
         all_weights = {k: self.weight_getter(k) for k in self._known_keys(before)}
+        meta: dict[str, Any] = {
+            "iter": current_iter,
+            "patch": patch,
+            "rationale": rationale,
+            "expected_effect": expected_effect,
+            "rollback_if": rollback_if,
+        }
+        if thinking_time is not None:
+            meta["thinking_time_s"] = round(thinking_time, 2)
         self._write_yaml(
             self.version,
             all_weights,
-            meta={
-                "iter": current_iter,
-                "patch": patch,
-                "rationale": rationale,
-                "expected_effect": expected_effect,
-                "rollback_if": rollback_if,
-            },
+            meta=meta,
         )
 
         record = AppliedPatch(

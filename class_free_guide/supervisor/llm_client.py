@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from abc import ABC, abstractmethod
 from typing import Any
@@ -41,6 +42,15 @@ class LLMClient(ABC):
         current_weights: dict[str, float],
         objective_block: str | None = None,
     ) -> dict[str, Any]: ...
+
+    def test_connection(self, timeout: float = 30.0) -> bool:
+        """Send a minimal request to verify the LLM is reachable.
+
+        Returns True if the API responds within *timeout* seconds.
+        The default implementation always returns True (used by StubClient).
+        Subclasses SHOULD override this to perform an actual API call.
+        """
+        return True
 
 
 def build_client(cfg: SupervisorConfig) -> LLMClient:
@@ -85,13 +95,50 @@ class ClaudeClient(LLMClient):
         self._client = anthropic.Anthropic(api_key=api_key)
         self.cfg = cfg
 
+        # ---- validate thinking_level configuration ---------------------------
+        thinking_level = getattr(cfg, "thinking_level", None)
+        if thinking_level and thinking_level in self._THINKING_BUDGET:
+            budget = self._THINKING_BUDGET[thinking_level]
+            # 1. max_tokens must exceed the thinking budget (Anthropic hard requirement).
+            if cfg.max_tokens <= budget:
+                raise ValueError(
+                    f"thinking_level={thinking_level} requires budget_tokens={budget}, "
+                    f"but max_tokens={cfg.max_tokens}. "
+                    f"Set max_tokens > {budget} in supervisor.yaml "
+                    f"(recommended: max_tokens={budget + 4096} or higher)."
+                )
+            # 2. Check that the installed anthropic SDK supports extended thinking.
+            min_version = (0, 39, 0)
+            current = tuple(int(x) for x in anthropic.__version__.split(".")[:3])
+            if current < min_version:
+                raise RuntimeError(
+                    f"Anthropic SDK {anthropic.__version__} does not support extended thinking. "
+                    f"Upgrade to >=0.39.0: pip install 'anthropic>=0.39.0'"
+                )
+            # 3. Log the thinking configuration so it shows up in training output.
+            logging.getLogger(__name__).info(
+                "[supervisor] extended thinking enabled: level=%s budget=%d max_tokens=%d sdk=%s",
+                thinking_level,
+                budget,
+                cfg.max_tokens,
+                anthropic.__version__,
+            )
+
+    # Budget tokens for each thinking level.
+    _THINKING_BUDGET: dict[str, int] = {
+        "xhigh": 16000,
+        "high": 8192,
+        "medium": 4096,
+        "small": 1024,
+    }
+
     def _call(self, system: str, user_blocks: list[dict[str, Any]]) -> str:
         # ``cache_control`` on the system prompt — it is stable across cycles
         # and large enough to benefit from caching.
-        resp = self._client.messages.create(
+        kwargs: dict[str, Any] = dict(
             model=self.cfg.model,
             max_tokens=self.cfg.max_tokens,
-            temperature=self.cfg.temperature,
+            messages=[{"role": "user", "content": user_blocks}],
             system=[
                 {
                     "type": "text",
@@ -99,8 +146,17 @@ class ClaudeClient(LLMClient):
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            messages=[{"role": "user", "content": user_blocks}],
         )
+
+        thinking_level = getattr(self.cfg, "thinking_level", None)
+        if thinking_level and thinking_level in self._THINKING_BUDGET:
+            budget = self._THINKING_BUDGET[thinking_level]
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            kwargs["temperature"] = 1.0  # API requires temperature=1 when extended thinking is enabled
+        else:
+            kwargs["temperature"] = self.cfg.temperature
+
+        resp = self._client.messages.create(**kwargs)
         for block in resp.content:
             if getattr(block, "type", None) == "text":
                 return block.text
@@ -121,18 +177,19 @@ class ClaudeClient(LLMClient):
                 ),
             }
         ]
-        for label, png in frames:
-            user.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": base64.b64encode(png).decode("ascii"),
-                    },
-                }
-            )
-            user.append({"type": "text", "text": f"(frame: {label})"})
+        if not self.cfg.only_text:
+            for label, png in frames:
+                user.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64.b64encode(png).decode("ascii"),
+                        },
+                    }
+                )
+                user.append({"type": "text", "text": f"(frame: {label})"})
         text = self._call(DIAGNOSE_SYSTEM, user)
         return _parse_json(text)
 
@@ -156,6 +213,26 @@ class ClaudeClient(LLMClient):
         )
         text = self._call(PROPOSE_SYSTEM, [{"type": "text", "text": body}])
         return _parse_json(text)
+
+    def test_connection(self, timeout: float = 30.0) -> bool:
+        """Send a minimal request to verify the Anthropic API is reachable.
+
+        Returns True on success, False on any error (timeout, auth, network, etc.).
+        The caller is responsible for deciding how to handle the failure.
+        """
+        log = logging.getLogger(__name__)
+        try:
+            self._client.messages.create(
+                model=self.cfg.model,
+                max_tokens=10,
+                temperature=0,
+                messages=[{"role": "user", "content": "Reply with: OK"}],
+                timeout=timeout,
+            )
+            return True
+        except Exception as e:
+            log.error("[supervisor] LLM connectivity check failed: %s", e)
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -206,18 +283,34 @@ class OpenAIClient(LLMClient):
                 ),
             }
         ]
-        for label, png in frames:
-            user.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,"
-                        + base64.b64encode(png).decode("ascii"),
-                    },
-                }
-            )
-            user.append({"type": "text", "text": f"(frame: {label})"})
-        return _parse_json(self._call(DIAGNOSE_SYSTEM, user))
+        if not self.cfg.only_text:
+            for label, png in frames:
+                user.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,"
+                            + base64.b64encode(png).decode("ascii"),
+                        },
+                    }
+                )
+                user.append({"type": "text", "text": f"(frame: {label})"})
+        try:
+            return _parse_json(self._call(DIAGNOSE_SYSTEM, user))
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            # Detect APIs that reject multimodal image_url blocks.
+            # Only fatal when only_text is off (user asked for vision).
+            if not self.cfg.only_text and "image_url" in err_msg and ("unknown variant" in err_msg or "expected" in err_msg):
+                raise RuntimeError(
+                    f"Supervisor requires a vision-capable model, but "
+                    f"'{self.cfg.model}' does not accept image inputs. "
+                    f"The API returned: {exc}. "
+                    f"Switch to a multimodal model (e.g. gpt-4o, claude-opus-4-7, "
+                    f"or any model that supports image_url content blocks) "
+                    f"and restart training."
+                ) from exc
+            raise
 
     def propose(
         self,
@@ -238,6 +331,77 @@ class OpenAIClient(LLMClient):
             )
         )
         return _parse_json(self._call(PROPOSE_SYSTEM, [{"type": "text", "text": body}]))
+
+    def test_connection(self, timeout: float = 30.0) -> bool:
+        """Send a minimal request to verify the API is reachable.
+
+        When ``only_text`` is False (default) the request includes a tiny PNG
+        to confirm the model supports vision.  A non-vision model causes a
+        ``RuntimeError`` so training can abort before wasting GPU hours.
+
+        When ``only_text`` is True the request is plain text — any model works.
+
+        Returns True on success.
+        Raises RuntimeError when the API rejects ``image_url`` blocks (non-
+        vision model, only_text=False).
+        Returns False on other errors (timeout, auth, network, etc.).
+        """
+        log = logging.getLogger(__name__)
+        if self.cfg.only_text:
+            # Plain-text probe — any model suffices.
+            try:
+                self._client.chat.completions.create(
+                    model=self.cfg.model,
+                    max_tokens=10,
+                    temperature=0,
+                    messages=[{"role": "user", "content": "Reply with: OK"}],
+                    timeout=timeout,
+                )
+                return True
+            except Exception as e:
+                log.error("[supervisor] LLM connectivity check failed: %s", e)
+                return False
+
+        # Multimodal probe — must accept image_url blocks.
+        # 1×1 red pixel PNG (valid, minimal, ~68 bytes).
+        DUMMY_PNG_B64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+        )
+        try:
+            self._client.chat.completions.create(
+                model=self.cfg.model,
+                max_tokens=10,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Reply with: OK"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64," + DUMMY_PNG_B64},
+                            },
+                        ],
+                    }
+                ],
+                timeout=timeout,
+            )
+            return True
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "image_url" in err_msg and (
+                "unknown variant" in err_msg or "expected" in err_msg
+            ):
+                raise RuntimeError(
+                    f"Supervisor requires a vision-capable model, but "
+                    f"'{self.cfg.model}' does not accept image inputs. "
+                    f"The API returned: {e}. "
+                    f"Switch to a multimodal model (e.g. gpt-4o, claude-opus-4-7, "
+                    f"or any model that supports image_url content blocks) "
+                    f"and restart training."
+                ) from e
+            log.error("[supervisor] LLM connectivity check failed: %s", e)
+            return False
 
 
 # ---------------------------------------------------------------------------

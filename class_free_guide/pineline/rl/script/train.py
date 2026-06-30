@@ -394,6 +394,29 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
             print(f"[WARN] Failed to start reward supervisor: {e}")
             supervisor = None
 
+    # Pre-flight LLM connectivity check (rank 0 only, supervisor enabled).
+    # Runs BEFORE the training loop so we don't waste GPU hours on a run
+    # whose supervisor can never reach the LLM.  A timeout or connectivity
+    # error here causes the script to exit with a non-zero code.
+    if supervisor is not None and rank == 0:
+        print(
+            f"[INFO] Testing LLM connectivity "
+            f"(provider={sup_cfg.provider}, model={sup_cfg.model})...",
+            flush=True,
+        )
+        if not supervisor.llm.test_connection(timeout=30.0):
+            raise RuntimeError(
+                f"Supervisor LLM connectivity check FAILED. "
+                f"The {sup_cfg.provider} model '{sup_cfg.model}' is unreachable. "
+                f"Check your API key (env: {sup_cfg.api_key_env or 'N/A'}), "
+                f"network, and model name. "
+                f"To skip the supervisor, remove --supervisor from the CLI."
+            )
+        if sup_cfg.only_text:
+            print("[INFO] LLM connectivity OK (text-only mode, vision disabled).", flush=True)
+        else:
+            print("[INFO] LLM connectivity OK (vision supported).", flush=True)
+
     real_max_iterations = cfg.agent.max_iterations if not is_supervisor else 10000000
     num_learning_iterations = real_max_iterations
     print(f"[INFO] Training for {num_learning_iterations} iterations (max_iterations={real_max_iterations})")

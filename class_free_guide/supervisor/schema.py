@@ -64,9 +64,9 @@ class RewardSchema:
             old_val = current.get(name, bound.default)
             denom = max(abs(old_val), 1e-6)
             rel = abs(new_val_f - old_val) / denom
-            if rel > max_rel_change:
+            if rel > max_rel_change + 1e-9:
                 return False, (
-                    f"{name} relative change {rel:.2f} exceeds limit {max_rel_change}"
+                    f"{name} relative change {rel:.3f} exceeds limit {max_rel_change}"
                 ), {}
             clamped[name] = new_val_f
         return True, "ok", clamped

@@ -56,12 +56,33 @@ class SupervisorConfig:
     # Training-objective JSON; overrides the built-in default if set.
     objective_path: str | None = None
 
+    # Multimodal: when True the supervisor sends NO images to the LLM
+    # (text-only mode).  Use for non-vision models or to reduce token cost.
+    only_text: bool = False
+
+    # Extended thinking / reasoning budget for Anthropic Claude.
+    # Controls how many tokens the model spends on internal chain-of-thought.
+    # Supported values:
+    #   "xhigh"  -> 16000 budget tokens (deepest reasoning)
+    #   "high"   ->  8192 budget tokens
+    #   "medium" ->  4096 budget tokens
+    #   "small"  ->  1024 budget tokens (minimum)
+    #   null / None -> thinking disabled (default, no extended thinking)
+    #
+    # NOTE: When thinking is enabled, the Anthropic API requires
+    #   max_tokens > budget_tokens, and temperature is ignored.
+    # Currently only implemented for provider="anthropic".
+    thinking_level: str | None = None
+
     # IPC (dzipc shared-memory publisher for external monitoring)
     ipc_enabled: bool = False
     ipc_topic: str = "supervisor_status"
     ipc_domain: int = 1
 
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # Programmatic safety monitoring (independent of LLM cycles)
+    safety: dict = field(default_factory=dict)
 
     @staticmethod
     def load(path: str | Path | None) -> "SupervisorConfig":
@@ -92,3 +113,41 @@ class RewardBound:
 
     def contains(self, value: float) -> bool:
         return self.min <= value <= self.max
+
+
+@dataclass
+class SafetyThreshold:
+    """A single safety threshold rule evaluated against TensorBoard scalars."""
+
+    tag: str  # e.g. "Episode_Termination/illegal_contact"
+    op: str  # ">" | "<" | ">=" | "<="
+    value: float  # threshold value
+    action: str  # "stop" | "rollback"
+    description: str = ""
+
+
+@dataclass
+class SafetyConfig:
+    """Programmatic safety monitoring configuration.
+
+    Evaluates TensorBoard scalars against hard thresholds at high frequency,
+    independent of the slower LLM diagnosis cycle.
+    """
+
+    enabled: bool = True
+    check_interval_s: float = 60.0  # how often to poll TB scalars
+    metrics_window: int = 50  # last N TB points to consider
+    thresholds: list[SafetyThreshold] = field(default_factory=list)
+
+    @staticmethod
+    def from_dict(data: dict | None) -> "SafetyConfig":
+        if not data:
+            return SafetyConfig()
+        thresholds_raw = data.get("thresholds", [])
+        thresholds = [SafetyThreshold(**t) for t in thresholds_raw]
+        return SafetyConfig(
+            enabled=data.get("enabled", True),
+            check_interval_s=float(data.get("check_interval_s", 60.0)),
+            metrics_window=int(data.get("metrics_window", 50)),
+            thresholds=thresholds,
+        )

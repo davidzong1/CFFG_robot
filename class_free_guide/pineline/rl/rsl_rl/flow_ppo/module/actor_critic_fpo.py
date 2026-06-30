@@ -101,7 +101,12 @@ class ActorCritic(nn.Module):
 
         # Compile the inner flow integration loop for CUDA graph replay.
         # Cached CUDA graph can lead to a 3~9x speedup.
-        self._compiled_integrate_flow = torch.compile(self._integrate_flow, mode="reduce-overhead")
+        # NOTE: mode="reduce-overhead" uses CUDA graphs which can cause
+        # "Expected stream_.device_type() == DeviceType::CUDA" errors in the
+        # autograd backward pass when graph-replayed tensors interact with
+        # non-graph autograd operations. Use "default" mode as a safe fallback
+        # that still gives excellent performance via TorchInductor.
+        self._compiled_integrate_flow = torch.compile(self._integrate_flow, mode="default")
 
     def reset(self, dones=None):
         pass

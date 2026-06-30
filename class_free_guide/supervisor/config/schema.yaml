@@ -4,7 +4,7 @@
 # refuses any patch outside [min, max] and limits per-cycle relative change
 # (see SupervisorConfig.max_rel_change).
 #
-# Defaults below mirror task_cfg.py:261-361 (Unitree-Go2 velocity task).
+# Defaults below mirror vel_task_cfg.py:261-354 (velocity task).
 # Positive rewards: max ≈ 5× current, min ≈ 0.1× current.
 # Penalties: max = 0, min ≈ 5× current.
 
@@ -23,64 +23,64 @@ terms:
     default: -1.0
     min: -5.0
     max: 0.0
-    description: "Penalty for body tilt away from upright."
+    description: "Penalty for body tilt away from upright (body_names set per-robot)."
   pose:
     default: 1.0
     min: 0.0
     max: 5.0
-    description: "Variable-posture reward (stand/walk/run dependent)."
+    description: "Variable-posture reward with speed-dependent std tolerances (stand/walk/run)."
   body_ang_vel:
     default: -0.05
-    min: -0.5
-    max: 0.0
-    description: "Penalty on body angular velocity."
-  angular_momentum:
-    default: -0.025
     min: -0.25
     max: 0.0
-    description: "Penalty on body angular momentum."
+    description: "Penalty on body angular velocity (body_names set per-robot)."
+  angular_momentum:
+    default: -0.025
+    min: -0.125
+    max: 0.0
+    description: "Penalty on whole-body angular momentum."
   is_terminated:
-    default: -20.0
-    min: -500.0
+    default: -200.0
+    min: -1000.0
     max: 0.0
-    description: "Penalty on early termination (fall/timeout)."
+    description: "Penalty on early episode termination (fall/timeout)."
   joint_acc_l2:
-    default: -0.00000025
-    min: -0.000005
+    default: -2.5e-7
+    min: -1.25e-6
     max: 0.0
-    description: "Joint acceleration L2 penalty (smoothness)."
+    description: "Joint acceleration L2 penalty for motion smoothness."
   joint_pos_limits:
     default: -10.0
     min: -50.0
     max: 0.0
-    description: "Penalty for hitting joint position limits."
+    description: "Penalty for approaching joint position limits."
   action_rate_l2:
     default: -0.05
-    min: -0.5
+    min: -0.25
     max: 0.0
-    description: "Penalty on action change rate (smoothness)."
+    description: "Penalty on action change rate for temporal smoothness."
   foot_gait:
     default: 0.5
-    min: 0.0
+    min: 0.05
     max: 2.5
-    description: "Bonus for matching the prescribed gait pattern."
+    description: "Bonus for matching the prescribed trot gait pattern (period=0.6s)."
   foot_clearance:
     default: -1.0
     min: -5.0
     max: 0.0
-    description: "Penalty for incorrect swing-foot height."
+    description: "Penalty for incorrect swing-foot height (target=0.10m, gated by command)."
   foot_slip:
     default: -0.25
-    min: -2.0
+    min: -1.25
     max: 0.0
-    description: "Penalty for slipping while in contact."
+    description: "Penalty for foot sliding while in contact (gated by command)."
   soft_landing:
     default: -0.001
-    min: -0.1
+    min: -0.005
     max: 0.0
-    description: "Penalty for hard foot contacts at touchdown."
+    description: "Penalty for high foot impact forces at touchdown (gated by command)."
   stand_still:
     default: -1.0
     min: -5.0
     max: 0.0
-    description: "Penalty for moving when zero-velocity command is issued."
+    description: "Penalty for joint deviation when zero-velocity command is issued."

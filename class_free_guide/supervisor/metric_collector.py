@@ -83,6 +83,8 @@ class MetricCollector:
         "Episode_Reward/",
         "Episode_Termination/",
         "Episode/",
+        "Episode_Metrics/",
+        "Metrics/",
         "Curriculum/",
     )
 

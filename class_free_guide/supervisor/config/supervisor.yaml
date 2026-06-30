@@ -54,6 +54,21 @@ provider: anthropic # Any router mode both select openrouter and set api_base to
 model: claude-opus-4-7
 max_tokens: 2048
 temperature: 0.3 # dont change
+
+# ---- Thinking / reasoning budget (Anthropic Claude only) ------------------------
+# Controls how many tokens the model spends on internal chain-of-thought.
+# Supported values:
+#   "xhigh"  -> 16000 budget tokens (deepest reasoning, longest latency)
+#   "high"   ->  8192 budget tokens
+#   "medium" ->  4096 budget tokens
+#   "small"  ->  1024 budget tokens (minimum, fastest)
+#   null     -> thinking disabled (default, no extended thinking)
+#
+# NOTE: When thinking is enabled, max_tokens must be > thinking budget tokens,
+# and temperature is ignored by the API.  Choosing a higher thinking level
+# produces more thorough diagnosis and better patches, but each cycle takes
+# longer and costs more.
+thinking_level: null
 api_base: null
 # API key: set either ``api_key`` (inline key in this file) or ``api_key_env``
 # (name of an environment variable).  ``api_key`` takes precedence.
