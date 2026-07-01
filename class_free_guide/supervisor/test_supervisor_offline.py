@@ -70,17 +70,20 @@ class ScriptedClient(LLMClient):
     def __init__(self, patch: dict[str, float]):
         self._patch = patch
         self.last_objective_block: str | None = None
+        self.last_skill_block: str | None = None
 
-    def diagnose(self, snapshot_summary, current_weights, frames, objective_block=None):
+    def diagnose(self, snapshot_summary, current_weights, frames, objective_block=None, skill_block=None):
         self.last_objective_block = objective_block
+        self.last_skill_block = skill_block
         return {
             "observations": ["test"],
             "hypotheses": ["test"],
             "confidence": 0.9,
         }
 
-    def propose(self, diagnose_result, schema_summary, current_weights, objective_block=None):
+    def propose(self, diagnose_result, schema_summary, current_weights, objective_block=None, skill_block=None):
         self.last_objective_block = objective_block
+        self.last_skill_block = skill_block
         return {
             "rationale": "scripted test patch",
             "patch": self._patch,
@@ -257,6 +260,96 @@ def test_killswitch_pauses_cycle(tmp_path, monkeypatch):
     assert any(json.loads(block)["kind"] == "paused" for block in audit)
 
 
+def test_skill_memory_created_and_passed_to_llm(tmp_path, monkeypatch):
+    patch = {"action_rate_l2": -0.04}
+    sup, _env = _make_supervisor(tmp_path, patch)
+
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    sup._run_cycle()
+
+    skill_path = Path("class_free_guide/supervisor/skill/SKILL.md")
+    assert skill_path.exists()
+    assert "Supervisor RL Knowledge" in skill_path.read_text()
+    assert isinstance(sup.llm.last_skill_block, str)
+    assert "Supervisor RL Knowledge" in sup.llm.last_skill_block
+
+
+def test_skill_memory_not_updated_before_min_iter(tmp_path, monkeypatch):
+    class DistillingClient(ScriptedClient):
+        def distill_skill(self, current_skill, cycle):
+            return current_skill + "\n## Should Not Appear\n"
+
+    weights = {"track_linear_velocity": 1.0, "action_rate_l2": -0.05, "foot_slip": -0.25}
+    env = FakeEnv(weights)
+    skill_path = tmp_path / "skill" / "SKILL.md"
+    cfg = SupervisorConfig(
+        interval_min=60.0,
+        cooldown_iters=0,
+        warmup_iters=0,
+        max_patch_fields=3,
+        max_rel_change=0.30,
+        provider="stub",
+        skill_memory_path=str(skill_path),
+        skill_memory_min_update_iter=1500,
+    )
+    sup = Supervisor.from_rl_env(
+        env=env,
+        writer=None,
+        log_dir=tmp_path,
+        config=cfg,
+        llm=DistillingClient({"action_rate_l2": -0.04}),
+        iter_getter=lambda: 1499,
+    )
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    before = skill_path.read_text()
+    sup._run_cycle()
+
+    assert skill_path.read_text() == before
+
+
+def test_skill_memory_updated_at_min_iter(tmp_path, monkeypatch):
+    class DistillingClient(ScriptedClient):
+        def distill_skill(self, current_skill, cycle):
+            assert cycle["iter"] == 1500
+            assert cycle["outcome"]["kind"] == "applied"
+            return current_skill + "\n## Distilled Lesson\n- Iter 1500: action_rate_l2 patch was applied.\n"
+
+    weights = {"track_linear_velocity": 1.0, "action_rate_l2": -0.05, "foot_slip": -0.25}
+    env = FakeEnv(weights)
+    skill_path = tmp_path / "skill" / "SKILL.md"
+    cfg = SupervisorConfig(
+        interval_min=60.0,
+        cooldown_iters=0,
+        warmup_iters=0,
+        max_patch_fields=3,
+        max_rel_change=0.30,
+        provider="stub",
+        skill_memory_path=str(skill_path),
+        skill_memory_min_update_iter=1500,
+    )
+    sup = Supervisor.from_rl_env(
+        env=env,
+        writer=None,
+        log_dir=tmp_path,
+        config=cfg,
+        llm=DistillingClient({"action_rate_l2": -0.04}),
+        iter_getter=lambda: 1500,
+    )
+    monkeypatch.setattr(sup._callbacks, "metrics_getter", _seed_snapshot)
+    monkeypatch.setattr(sup._callbacks, "frames_getter", lambda overlay=None: [])
+    sup.patcher.write_initial_snapshot(sup._current_weights())
+    sup._run_cycle()
+
+    text = skill_path.read_text()
+    assert "Distilled Lesson" in text
+    audit = (tmp_path / "supervisor" / "audit.jsonl").read_text().strip().split("\n\n")
+    assert any(json.loads(block)["kind"] == "skill_distilled" for block in audit)
+
+
 def test_objective_loaded_and_passed_to_llm(tmp_path, monkeypatch):
     """A JSON objective on disk must reach the LLM call and the audit log."""
     obj_path = tmp_path / "obj.json"
@@ -397,6 +490,61 @@ def test_openrouter_missing_key_raises(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="No API key found"):
         build_client(cfg)
+
+
+def test_openai_thinking_level_sets_reasoning_effort(monkeypatch):
+    """OpenAI-compatible calls should translate thinking_level to reasoning_effort."""
+    from class_free_guide.supervisor.llm_client import OpenAIClient
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    client = OpenAIClient(SupervisorConfig(provider="openai", thinking_level="medium"))
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+        )
+
+    monkeypatch.setattr(client._client.chat.completions, "create", fake_create)
+    assert client._call("system", [{"type": "text", "text": "state"}]) == '{"ok": true}'
+    assert captured["reasoning_effort"] == "medium"
+
+
+def test_openrouter_thinking_level_sets_reasoning_body(monkeypatch):
+    """OpenRouter calls should translate thinking_level to extra_body.reasoning."""
+    from class_free_guide.supervisor.llm_client import OpenRouterClient
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-key")
+    client = OpenRouterClient(
+        SupervisorConfig(
+            provider="openrouter",
+            api_base="https://openrouter.ai/api/v1",
+            thinking_level="high",
+        )
+    )
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+        )
+
+    monkeypatch.setattr(client._client.chat.completions, "create", fake_create)
+    assert client._call("system", [{"type": "text", "text": "state"}]) == '{"ok": true}'
+    assert captured["extra_body"] == {
+        "reasoning": {"effort": "high", "exclude": False}
+    }
+
+
+def test_unknown_thinking_level_raises(monkeypatch):
+    """Invalid thinking_level values should fail before a network request."""
+    from class_free_guide.supervisor.llm_client import OpenAIClient
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    with pytest.raises(ValueError, match="Unsupported thinking_level"):
+        OpenAIClient(SupervisorConfig(provider="openai", thinking_level="extreme"))
 
 
 # ---------------------------------------------------------------------------

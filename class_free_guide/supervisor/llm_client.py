@@ -19,7 +19,42 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from .config import SupervisorConfig
-from .prompts import DIAGNOSE_SYSTEM, PROPOSE_SYSTEM, render_state
+from .prompts import DIAGNOSE_SYSTEM, DISTILL_SKILL_SYSTEM, PROPOSE_SYSTEM, render_state
+
+
+_THINKING_BUDGET: dict[str, int] = {
+    "xhigh": 16000,
+    "high": 8192,
+    "medium": 4096,
+    "small": 1024,
+}
+
+_OPENAI_REASONING_EFFORT: dict[str, str] = {
+    "xhigh": "high",
+    "high": "high",
+    "medium": "medium",
+    "small": "low",
+}
+
+_OPENROUTER_REASONING_EFFORT: dict[str, str] = {
+    "xhigh": "xhigh",
+    "high": "high",
+    "medium": "medium",
+    "small": "low",
+}
+
+
+def _thinking_level(cfg: SupervisorConfig) -> str | None:
+    level = getattr(cfg, "thinking_level", None)
+    if level is None:
+        return None
+    level = str(level).strip().lower()
+    if not level:
+        return None
+    if level not in _THINKING_BUDGET:
+        allowed = ", ".join(_THINKING_BUDGET)
+        raise ValueError(f"Unsupported thinking_level={level!r}. Expected one of: {allowed}")
+    return level
 
 
 class LLMClient(ABC):
@@ -32,6 +67,7 @@ class LLMClient(ABC):
         current_weights: dict[str, float],
         frames: list[tuple[str, bytes]],
         objective_block: str | None = None,
+        skill_block: str | None = None,
     ) -> dict[str, Any]: ...
 
     @abstractmethod
@@ -41,7 +77,11 @@ class LLMClient(ABC):
         schema_summary: dict[str, dict[str, float]],
         current_weights: dict[str, float],
         objective_block: str | None = None,
+        skill_block: str | None = None,
     ) -> dict[str, Any]: ...
+
+    def distill_skill(self, current_skill: str, cycle: dict[str, Any]) -> str:
+        raise NotImplementedError(f"{type(self).__name__} does not support skill distillation")
 
     def test_connection(self, timeout: float = 30.0) -> bool:
         """Send a minimal request to verify the LLM is reachable.
@@ -96,9 +136,9 @@ class ClaudeClient(LLMClient):
         self.cfg = cfg
 
         # ---- validate thinking_level configuration ---------------------------
-        thinking_level = getattr(cfg, "thinking_level", None)
-        if thinking_level and thinking_level in self._THINKING_BUDGET:
-            budget = self._THINKING_BUDGET[thinking_level]
+        thinking_level = _thinking_level(cfg)
+        if thinking_level:
+            budget = _THINKING_BUDGET[thinking_level]
             # 1. max_tokens must exceed the thinking budget (Anthropic hard requirement).
             if cfg.max_tokens <= budget:
                 raise ValueError(
@@ -124,14 +164,6 @@ class ClaudeClient(LLMClient):
                 anthropic.__version__,
             )
 
-    # Budget tokens for each thinking level.
-    _THINKING_BUDGET: dict[str, int] = {
-        "xhigh": 16000,
-        "high": 8192,
-        "medium": 4096,
-        "small": 1024,
-    }
-
     def _call(self, system: str, user_blocks: list[dict[str, Any]]) -> str:
         # ``cache_control`` on the system prompt — it is stable across cycles
         # and large enough to benefit from caching.
@@ -148,9 +180,9 @@ class ClaudeClient(LLMClient):
             ],
         )
 
-        thinking_level = getattr(self.cfg, "thinking_level", None)
-        if thinking_level and thinking_level in self._THINKING_BUDGET:
-            budget = self._THINKING_BUDGET[thinking_level]
+        thinking_level = _thinking_level(self.cfg)
+        if thinking_level:
+            budget = _THINKING_BUDGET[thinking_level]
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["temperature"] = 1.0  # API requires temperature=1 when extended thinking is enabled
         else:
@@ -168,12 +200,16 @@ class ClaudeClient(LLMClient):
         current_weights: dict[str, float],
         frames: list[tuple[str, bytes]],
         objective_block: str | None = None,
+        skill_block: str | None = None,
     ) -> dict[str, Any]:
         user: list[dict[str, Any]] = [
             {
                 "type": "text",
                 "text": render_state(
-                    snapshot_summary, current_weights, objective_block=objective_block
+                    snapshot_summary,
+                    current_weights,
+                    objective_block=objective_block,
+                    skill_block=skill_block,
                 ),
             }
         ]
@@ -199,6 +235,7 @@ class ClaudeClient(LLMClient):
         schema_summary: dict[str, dict[str, float]],
         current_weights: dict[str, float],
         objective_block: str | None = None,
+        skill_block: str | None = None,
     ) -> dict[str, Any]:
         body = (
             "## Prior diagnosis\n```json\n"
@@ -209,10 +246,15 @@ class ClaudeClient(LLMClient):
                 current_weights,
                 schema_summary=schema_summary,
                 objective_block=objective_block,
+                skill_block=skill_block,
             )
         )
         text = self._call(PROPOSE_SYSTEM, [{"type": "text", "text": body}])
         return _parse_json(text)
+
+    def distill_skill(self, current_skill: str, cycle: dict[str, Any]) -> str:
+        body = _render_skill_distill_body(current_skill, cycle)
+        return self._call(DISTILL_SKILL_SYSTEM, [{"type": "text", "text": body}])
 
     def test_connection(self, timeout: float = 30.0) -> bool:
         """Send a minimal request to verify the Anthropic API is reachable.
@@ -254,18 +296,35 @@ class OpenAIClient(LLMClient):
             kwargs["default_headers"] = dict(cfg.extra_headers)
         self._client = openai.OpenAI(**kwargs)
         self.cfg = cfg
+        self._reasoning_effort = self._build_reasoning_effort(cfg)
+
+    def _build_reasoning_effort(self, cfg: SupervisorConfig) -> str | None:
+        level = _thinking_level(cfg)
+        if level is None:
+            return None
+        effort = _OPENAI_REASONING_EFFORT[level]
+        logging.getLogger(__name__).info(
+            "[supervisor] reasoning effort enabled: provider=%s level=%s effort=%s",
+            cfg.provider,
+            level,
+            effort,
+        )
+        return effort
 
     def _call(self, system: str, user_content: list[dict[str, Any]]) -> str:
-        resp = self._client.chat.completions.create(
-            model=self.cfg.model,
-            max_tokens=self.cfg.max_tokens,
-            temperature=self.cfg.temperature,
-            response_format={"type": "json_object"},
-            messages=[
+        kwargs: dict[str, Any] = {
+            "model": self.cfg.model,
+            "max_tokens": self.cfg.max_tokens,
+            "temperature": self.cfg.temperature,
+            "response_format": {"type": "json_object"},
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
-        )
+        }
+        if self._reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self._reasoning_effort
+        resp = self._client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
     def diagnose(
@@ -274,12 +333,16 @@ class OpenAIClient(LLMClient):
         current_weights: dict[str, float],
         frames: list[tuple[str, bytes]],
         objective_block: str | None = None,
+        skill_block: str | None = None,
     ) -> dict[str, Any]:
         user: list[dict[str, Any]] = [
             {
                 "type": "text",
                 "text": render_state(
-                    snapshot_summary, current_weights, objective_block=objective_block
+                    snapshot_summary,
+                    current_weights,
+                    objective_block=objective_block,
+                    skill_block=skill_block,
                 ),
             }
         ]
@@ -318,6 +381,7 @@ class OpenAIClient(LLMClient):
         schema_summary: dict[str, dict[str, float]],
         current_weights: dict[str, float],
         objective_block: str | None = None,
+        skill_block: str | None = None,
     ) -> dict[str, Any]:
         body = (
             "## Prior diagnosis\n```json\n"
@@ -328,9 +392,14 @@ class OpenAIClient(LLMClient):
                 current_weights,
                 schema_summary=schema_summary,
                 objective_block=objective_block,
+                skill_block=skill_block,
             )
         )
         return _parse_json(self._call(PROPOSE_SYSTEM, [{"type": "text", "text": body}]))
+
+    def distill_skill(self, current_skill: str, cycle: dict[str, Any]) -> str:
+        body = _render_skill_distill_body(current_skill, cycle)
+        return self._call(DISTILL_SKILL_SYSTEM, [{"type": "text", "text": body}])
 
     def test_connection(self, timeout: float = 30.0) -> bool:
         """Send a minimal request to verify the API is reachable.
@@ -463,6 +532,41 @@ class OpenRouterClient(OpenAIClient):
             default_headers=default_headers or None,
         )
         self.cfg = cfg
+        self._reasoning_effort = self._build_reasoning_effort(cfg)
+
+    def _build_reasoning_effort(self, cfg: SupervisorConfig) -> str | None:
+        level = _thinking_level(cfg)
+        if level is None:
+            return None
+        effort = _OPENROUTER_REASONING_EFFORT[level]
+        logging.getLogger(__name__).info(
+            "[supervisor] reasoning enabled: provider=%s level=%s effort=%s",
+            cfg.provider,
+            level,
+            effort,
+        )
+        return effort
+
+    def _call(self, system: str, user_content: list[dict[str, Any]]) -> str:
+        kwargs: dict[str, Any] = {
+            "model": self.cfg.model,
+            "max_tokens": self.cfg.max_tokens,
+            "temperature": self.cfg.temperature,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        if self._reasoning_effort is not None:
+            kwargs["extra_body"] = {
+                "reasoning": {
+                    "effort": self._reasoning_effort,
+                    "exclude": False,
+                }
+            }
+        resp = self._client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +580,7 @@ class StubClient(LLMClient):
     def __init__(self, cfg: SupervisorConfig):
         self.cfg = cfg
 
-    def diagnose(self, snapshot_summary, current_weights, frames, objective_block=None):
+    def diagnose(self, snapshot_summary, current_weights, frames, objective_block=None, skill_block=None):
         return {
             "observations": ["stub: no analysis performed"],
             "hypotheses": [],
@@ -484,13 +588,16 @@ class StubClient(LLMClient):
             "score": 0,
         }
 
-    def propose(self, diagnose_result, schema_summary, current_weights, objective_block=None):
+    def propose(self, diagnose_result, schema_summary, current_weights, objective_block=None, skill_block=None):
         return {
             "rationale": "stub: no patch",
             "patch": {},
             "expected_effect": "",
             "rollback_if": "",
         }
+
+    def distill_skill(self, current_skill: str, cycle: dict[str, Any]) -> str:
+        return current_skill
 
 
 # ---------------------------------------------------------------------------

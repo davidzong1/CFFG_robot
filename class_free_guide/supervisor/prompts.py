@@ -73,15 +73,42 @@ outside the JSON object.
 """
 
 
+
+DISTILL_SKILL_SYSTEM = """You maintain a persistent markdown SKILL.md knowledge base for an RL reward supervisor.
+
+You will receive the current SKILL.md and evidence from the latest supervisor cycle.
+Update the skill by distilling reusable, evidence-backed lessons about Unitree-Go2 FPO reward tuning.
+
+Rules:
+  - Return the complete new SKILL.md content, not a diff.
+  - Keep valid SKILL.md frontmatter with name and description.
+  - Preserve useful prior lessons; merge duplicates.
+  - Prefer concise, generalizable rules over run-specific narration.
+  - Include evidence with iteration numbers and whether patches were applied or rejected.
+  - Do not invent metrics, outcomes, or reward terms that are not present in the evidence.
+  - Keep the file under about 250 lines.
+
+Return only markdown.
+"""
+
 def render_state(
     snapshot_summary: dict[str, Any],
     current_weights: dict[str, float],
     schema_summary: dict[str, dict[str, float]] | None = None,
     objective_block: str | None = None,
+    skill_block: str | None = None,
 ) -> str:
     parts: list[str] = []
     if objective_block:
         parts += [objective_block, ""]
+    if skill_block:
+        parts += [
+            "## Persistent Supervisor Skill Knowledge",
+            "```markdown",
+            skill_block[:12000],
+            "```",
+            "",
+        ]
     parts += [
         "## TensorBoard snapshot",
         "```json",

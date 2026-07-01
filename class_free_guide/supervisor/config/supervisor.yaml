@@ -55,19 +55,13 @@ model: claude-opus-4-7
 max_tokens: 2048
 temperature: 0.3 # dont change
 
-# ---- Thinking / reasoning budget (Anthropic Claude only) ------------------------
-# Controls how many tokens the model spends on internal chain-of-thought.
-# Supported values:
-#   "xhigh"  -> 16000 budget tokens (deepest reasoning, longest latency)
-#   "high"   ->  8192 budget tokens
-#   "medium" ->  4096 budget tokens
-#   "small"  ->  1024 budget tokens (minimum, fastest)
-#   null     -> thinking disabled (default, no extended thinking)
-#
-# NOTE: When thinking is enabled, max_tokens must be > thinking budget tokens,
-# and temperature is ignored by the API.  Choosing a higher thinking level
-# produces more thorough diagnosis and better patches, but each cycle takes
-# longer and costs more.
+# ---- Thinking / reasoning --------------------------------------------------
+# Supported values: "xhigh", "high", "medium", "small", null.
+# Provider mapping:
+#   anthropic  -> thinking.budget_tokens (max_tokens must exceed budget)
+#   openai     -> reasoning_effort
+#   openrouter -> extra_body.reasoning.effort
+# Unsupported provider/model combinations may reject the request at runtime.
 thinking_level: null
 api_base: null
 # API key: set either ``api_key`` (inline key in this file) or ``api_key_env``
@@ -88,6 +82,13 @@ objective_path: class_free_guide/supervisor/objectives/stable_walk.json
 
 # Relative to repo root; falls back to packaged schema.yaml when null.
 schema_path: null
+
+# ---- Persistent supervisor skill memory ------------------------------------
+skill_memory_enabled: true
+skill_memory_path: class_free_guide/supervisor/skill/SKILL.md
+skill_memory_min_update_iter: 1500
+skill_memory_max_chars: 12000
+# ---- Inter-process communication (IPC) --------------------------------------
 ipc_enabled: true
 ipc_topic: supervisor_status
 ipc_domain: 1

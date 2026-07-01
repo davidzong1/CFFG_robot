@@ -18,6 +18,7 @@ from .patcher import RewardPatcher
 from .rollback import RollbackEvaluator
 from .safety import SafetyConfig, SafetyMonitor
 from .schema import RewardSchema
+from .skill_memory import SkillMemory
 import dzipc
 
 log = logging.getLogger(__name__)
@@ -118,6 +119,14 @@ class Supervisor:
             log_dir,
             safety_cfg,
             audit_writer=self._write_audit,
+        )
+
+        # ---- persistent skill memory ----------------------------------------
+        self.skill_memory = SkillMemory(
+            config.skill_memory_path,
+            enabled=config.skill_memory_enabled,
+            min_update_iter=config.skill_memory_min_update_iter,
+            max_chars=config.skill_memory_max_chars,
         )
 
         # ---- threading ------------------------------------------------------
@@ -360,6 +369,8 @@ class Supervisor:
 
         current_weights = self._current_weights()
         frames = self._callbacks.frames_getter(overlay={"iter": str(current_iter), "v": str(self.patcher.version)})
+        skill_block = self.skill_memory.read()
+        objective_block = self.objective.to_prompt_block()
 
         # ---- LLM diagnose ---------------------------------------------------
         t0 = time.monotonic()
@@ -367,7 +378,8 @@ class Supervisor:
             snapshot_summary,
             current_weights,
             frames,
-            objective_block=self.objective.to_prompt_block(),
+            objective_block=objective_block,
+            skill_block=skill_block,
         )
 
         # ---- early-stop check -----------------------------------------------
@@ -380,7 +392,8 @@ class Supervisor:
             diag,
             self._schema_summary(),
             current_weights,
-            objective_block=self.objective.to_prompt_block(),
+            objective_block=objective_block,
+            skill_block=skill_block,
         )
         thinking_time = time.monotonic() - t0
 
@@ -395,6 +408,15 @@ class Supervisor:
                     "diagnose": diag,
                     "proposal": proposal,
                 }
+            )
+            self._distill_skill(
+                current_iter=current_iter,
+                skill_block=skill_block,
+                snapshot_summary=snapshot_summary,
+                current_weights=current_weights,
+                diagnose=diag,
+                proposal=proposal,
+                outcome={"kind": "rejected", "reason": guard.reason},
             )
             # Still evaluate rollback against any previously armed rule.
             self.rollback.maybe_rollback(snapshot_summary, current_iter)
@@ -418,6 +440,19 @@ class Supervisor:
         self.guardrails.note_apply(current_iter)
         if record.rollback_if:
             self.rollback.watch(record.rollback_if)
+        self._distill_skill(
+            current_iter=current_iter,
+            skill_block=skill_block,
+            snapshot_summary=snapshot_summary,
+            current_weights=current_weights,
+            diagnose=diag,
+            proposal=proposal,
+            outcome={
+                "kind": "applied",
+                "version": record.version,
+                "patch": guard.clamped_patch,
+            },
+        )
         self._publish_status(
             update_time=str(current_iter),
             additional_info=json.dumps(
@@ -568,6 +603,53 @@ class Supervisor:
 
     def _schema_summary(self) -> dict[str, dict[str, float]]:
         return {name: {"min": b.min, "max": b.max, "default": b.default} for name, b in self.schema.bounds.items() if name in self._known_terms}
+
+    def _distill_skill(
+        self,
+        *,
+        current_iter: int,
+        skill_block: str,
+        snapshot_summary: dict[str, Any],
+        current_weights: dict[str, float],
+        diagnose: dict[str, Any],
+        proposal: dict[str, Any],
+        outcome: dict[str, Any],
+    ) -> None:
+        if not self.skill_memory.should_update(current_iter):
+            return
+        cycle = {
+            "iter": current_iter,
+            "objective": self.objective.name,
+            "snapshot_summary": snapshot_summary,
+            "current_weights": current_weights,
+            "diagnose": diagnose,
+            "proposal": proposal,
+            "outcome": outcome,
+        }
+        try:
+            updated = self.skill_memory.update_with_llm(
+                self.llm,
+                current_iter=current_iter,
+                current_skill=skill_block,
+                cycle=cycle,
+            )
+            if updated is not None:
+                self._write_audit(
+                    {
+                        "kind": "skill_distilled",
+                        "iter": current_iter,
+                        "path": str(self.skill_memory.path),
+                    }
+                )
+        except Exception as exc:
+            log.exception("[supervisor] skill distillation failed: %s", exc)
+            self._write_audit(
+                {
+                    "kind": "skill_distill_error",
+                    "iter": current_iter,
+                    "error": repr(exc),
+                }
+            )
 
     def _write_audit(self, payload: dict[str, Any]) -> None:
         payload = {"ts": time.time(), **payload}

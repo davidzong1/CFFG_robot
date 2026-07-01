@@ -2,15 +2,17 @@
   "name": "stable_walk",
   "summary": "Train a stable, low-oscillation trot that strictly tracks the commanded velocity. Stability comes first; raw speed and aesthetics are secondary.",
   "priorities": [
-    "Episode_Termination/time_out serves as a key metric for training convergence. In the early stages, due to unstable gaits or frequent early terminations, this value should remain near 0. As hyperparameter tuning progresses and the policy matures, the robot should consistently survive until the maximum episode length. If this value stagnates at a low level, it indicates that the current parameter set fails to improve survival duration—priority should be given to adjusting gait cycles and joint stiffness rather than solely pursuing speed.",
-    "Body stays close to upright (small body_orientation_l2 magnitude)",
-    "Low body angular velocity and angular momentum",
-    "Clean foot contacts with minimal slipping and soft landings",
-    "Tracking error is minimized only after the policy is stable"
+    "(Top priority) Episode_Termination/time_out serves as a key metric for training convergence. In the early stages, due to unstable gaits or frequent early terminations, this value should remain near 0. As hyperparameter tuning progresses and the policy matures, the robot should consistently survive until the maximum episode length. If this value stagnates at a low level, it indicates that the current parameter set fails to improve survival duration—priority should be given to adjusting gait cycles and joint stiffness rather than solely pursuing speed.",
+    "(Second priority) The robot should maintain a certain gait and enhance its speed tracking ability.",
+    "(Third priority) The body remains close to upright (with a small body_orientation_l2 magnitude) and possesses speed tracking capability.",
+    "(Fourth priority) Low body angular velocity and angular momentum",
+    "(Fifth priority) Clean foot contacts with minimal slipping and soft landings",
+    "(Sixth priority) Tracking error is minimized only after the policy is stable"
   ],
   "avoid": [
     "Avoidance Strategy for Episode_Termination/fell_over > 0.1 (Fall/Tipping)",
     "Avoidance Strategy for Episode_Termination/illegal_contact > 0.1 (Illegal Collision/Impact)",
+    "Avoid having the robot stand upright and remain motionless for extended periods",
     "Aggressive action changes that destabilize the body",
     "Trading away tracking_lin_vel weight to chase shaping rewards",
     "Reward hacking via foot_gait while ignoring orientation"

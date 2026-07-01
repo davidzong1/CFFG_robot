@@ -60,18 +60,18 @@ class SupervisorConfig:
     # (text-only mode).  Use for non-vision models or to reduce token cost.
     only_text: bool = False
 
-    # Extended thinking / reasoning budget for Anthropic Claude.
-    # Controls how many tokens the model spends on internal chain-of-thought.
+    # Extended thinking / reasoning control.
     # Supported values:
-    #   "xhigh"  -> 16000 budget tokens (deepest reasoning)
-    #   "high"   ->  8192 budget tokens
-    #   "medium" ->  4096 budget tokens
-    #   "small"  ->  1024 budget tokens (minimum)
-    #   null / None -> thinking disabled (default, no extended thinking)
+    #   "xhigh"  -> deepest reasoning where the provider supports it
+    #   "high"   -> high reasoning effort
+    #   "medium" -> medium reasoning effort
+    #   "small"  -> low/small reasoning effort
+    #   null / None -> thinking disabled (default)
     #
-    # NOTE: When thinking is enabled, the Anthropic API requires
-    #   max_tokens > budget_tokens, and temperature is ignored.
-    # Currently only implemented for provider="anthropic".
+    # Provider mapping:
+    #   anthropic  -> thinking.budget_tokens (max_tokens must exceed budget)
+    #   openai     -> reasoning_effort
+    #   openrouter -> extra_body.reasoning.effort
     thinking_level: str | None = None
 
     # IPC (dzipc shared-memory publisher for external monitoring)
@@ -80,6 +80,12 @@ class SupervisorConfig:
     ipc_domain: int = 1
 
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # Persistent skill memory / knowledge distillation.
+    skill_memory_enabled: bool = True
+    skill_memory_path: str = "class_free_guide/supervisor/skill/SKILL.md"
+    skill_memory_min_update_iter: int = 1500
+    skill_memory_max_chars: int = 12000
 
     # Programmatic safety monitoring (independent of LLM cycles)
     safety: dict = field(default_factory=dict)
