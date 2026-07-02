@@ -23,6 +23,8 @@ class SupervisorCallbacks:
                            optional ``overlay`` keyword argument.
         *params_getter*    returns {param_name: current_value} for all
                            known parameters.
+        *evaluation_getter* optionally returns auxiliary evaluation signals
+                           such as actor-critic value statistics.
 
     Action side (supervisor → framework):
         *param_setter*        (name, value) -> None; mutates a live parameter.
@@ -35,3 +37,4 @@ class SupervisorCallbacks:
     params_getter: Callable[[], dict[str, float]]
     param_setter: Callable[[str, float], None]
     known_params_getter: Callable[[], list[str]]
+    evaluation_getter: Callable[[], dict[str, Any]] | None = None

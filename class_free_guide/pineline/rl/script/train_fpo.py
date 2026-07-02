@@ -95,7 +95,7 @@ class FpoTrainConfig:
 
     env: ManagerBasedRlEnvCfg
     agent: FpoRslRlOnPolicyRunnerCfg
-    video: bool = True
+    video: bool = False
     video_length: int = 200
     video_interval: int = 5000
     enable_nan_guard: bool = False
@@ -122,6 +122,11 @@ class FpoTrainConfig:
     supervisor_config: str | None = None
     # Training-objective JSON path. CLI override beats supervisor_config.objective_path.
     objective: str | None = None
+    # Debug escape hatch for MuJoCo/EGL teardown segfaults in headless runs.
+    skip_env_close: bool = False
+    # Avoid MuJoCo/EGL/Python native destructor crashes after successful
+    # headless supervisor runs. Only used for single-process runs.
+    fast_exit_on_headless_supervisor: bool = True
 
     @staticmethod
     def from_task(task_id: str) -> "FpoTrainConfig":
@@ -353,6 +358,7 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
                 config=sup_cfg,
                 writer_getter=lambda: getattr(runner, "writer", None),
                 iter_getter=lambda: int(getattr(runner, "current_learning_iteration", 0)),
+                evaluation_getter=runner.get_value_evaluation,
                 stopping_event=stopping_event,
             )
             supervisor.start()
@@ -412,10 +418,35 @@ def run_fpo_train(task_id: str, cfg: FpoTrainConfig, log_dir: Path) -> None:
             init_at_random_ep_len=True,
         )
     finally:
+        print("[INFO] Cleanup: stopping supervisor...", flush=True)
         if supervisor is not None:
             supervisor.stop()
+        print("[INFO] Cleanup: closing runner...", flush=True)
+        if hasattr(runner, "close"):
+            runner.close()
+        print("[INFO] Cleanup: runner closed.", flush=True)
 
-    env.close()
+    if (
+        cfg.fast_exit_on_headless_supervisor
+        and cfg.headless
+        and cfg.supervisor
+        and int(os.environ.get("WORLD_SIZE", "1")) <= 1
+    ):
+        print(
+            "[WARN] Cleanup: fast process exit after successful headless supervisor run; "
+            "skipping env.close() to avoid native MuJoCo/EGL teardown segfault.",
+            flush=True,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+    if cfg.skip_env_close:
+        print("[WARN] Cleanup: skipping env.close() because --skip_env_close is set.", flush=True)
+    else:
+        print("[INFO] Cleanup: closing env...", flush=True)
+        env.close()
+        print("[INFO] Cleanup: env closed.", flush=True)
 
 
 def launch_fpo_training(task_id: str, args: FpoTrainConfig | None = None):
@@ -463,6 +494,10 @@ def launch_fpo_training(task_id: str, args: FpoTrainConfig | None = None):
     if env_overrides:
         _apply_dict_overrides(args.env, env_overrides)
 
+    if args.supervisor and not args.video:
+        object.__setattr__(args, "video", True)
+        print("[INFO] Supervisor enabled: forcing video recording on for multimodal frame sampling.")
+
     # Create log directory
     log_root_path = Path("logs") / "rsl_rl" / args.agent.experiment_name
     log_root_path.resolve()
@@ -480,17 +515,20 @@ def launch_fpo_training(task_id: str, args: FpoTrainConfig | None = None):
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, selected_gpus))
 
-    # Headless mode: use EGL/OSMesa backend and disable viewer
+    # Headless mode: use EGL offscreen rendering and avoid X11/GLX.
     if args.headless:
         os.environ["MUJOCO_GL"] = "egl"
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
         # Disable GPU rendering output (X11/GLX bypass)
         os.environ.pop("DISPLAY", None)
-        # Disable the viewer in env config if present
-        if hasattr(args.env, "viewer") and args.env.viewer is not None:
+        # Offscreen video rendering needs viewer config for camera/resolution.
+        # Only drop it when video is disabled.
+        if not args.video and hasattr(args.env, "viewer") and args.env.viewer is not None:
             args.env.viewer = None
-        # Disable video recording — OffscreenRenderer requires a viewer config.
-        object.__setattr__(args, "video", False)
-        print("[INFO] Headless mode enabled: MuJoCo GL backend set to EGL, viewer disabled.")
+        print(
+            f"[INFO] Headless mode enabled: MuJoCo GL backend set to EGL "
+            f"(video={'enabled' if args.video else 'disabled'})."
+        )
 
     if num_gpus <= 1:
         # CPU or single GPU

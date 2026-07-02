@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -160,6 +161,7 @@ class Supervisor:
         llm: LLMClient | None = None,
         iter_getter: Callable[[], int] | None = None,
         writer_getter: Callable[[], Any] | None = None,
+        evaluation_getter: Callable[[], dict[str, Any]] | None = None,
         objective: TrainingObjective | None = None,
         stopping_event: threading.Event | None = None,
     ) -> "Supervisor":
@@ -189,6 +191,7 @@ class Supervisor:
             param_setter=lambda name, val: setattr(reward_manager.get_term_cfg(name), "weight", float(val)),
             params_getter=lambda: {name: float(reward_manager.get_term_cfg(name).weight) for name in reward_manager.active_terms},
             known_params_getter=lambda: list(reward_manager.active_terms),
+            evaluation_getter=evaluation_getter,
         )
 
         if iter_getter is None:
@@ -241,6 +244,7 @@ class Supervisor:
             self._ipc_heartbeat_thread.join(timeout=min(timeout, 2.0))
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        self._close_ipc()
 
     # ------------------------------------------------------------------
     # Loop
@@ -386,11 +390,11 @@ class Supervisor:
         self._check_completion(diag, current_iter)
         if self._stopping_event is not None and self._stopping_event.is_set():
             return  # training is done — skip propose/patch this cycle
+        evaluation = self._evaluation_snapshot(diag)
 
         # ---- LLM propose ----------------------------------------------------
-        proposal = self.llm.propose(
+        proposal = self._propose_patch(
             diag,
-            self._schema_summary(),
             current_weights,
             objective_block=objective_block,
             skill_block=skill_block,
@@ -416,6 +420,7 @@ class Supervisor:
                 current_weights=current_weights,
                 diagnose=diag,
                 proposal=proposal,
+                evaluation=evaluation,
                 outcome={"kind": "rejected", "reason": guard.reason},
             )
             # Still evaluate rollback against any previously armed rule.
@@ -436,6 +441,7 @@ class Supervisor:
             diagnose=diag,
             current_iter=current_iter,
             thinking_time=thinking_time,
+            evaluation=evaluation,
         )
         self.guardrails.note_apply(current_iter)
         if record.rollback_if:
@@ -447,6 +453,7 @@ class Supervisor:
             current_weights=current_weights,
             diagnose=diag,
             proposal=proposal,
+            evaluation=evaluation,
             outcome={
                 "kind": "applied",
                 "version": record.version,
@@ -504,6 +511,18 @@ class Supervisor:
             self._ipc_pub = None
             self._ipc_msg_template = None
             self._ipc_topic_data = None
+
+    def _close_ipc(self) -> None:
+        """Drop dzipc native objects before interpreter/env teardown."""
+        self._ipc_pub = None
+        self._ipc_topic_data = None
+        self._ipc_msg_template = None
+        cleanup = getattr(dzipc, "CleanupIpcInstances", None)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                log.debug("[supervisor] dzipc cleanup failed", exc_info=True)
 
     def _ipc_heartbeat_loop(self) -> None:
         """Background thread: publish status every 1 s so external monitors see
@@ -604,6 +623,77 @@ class Supervisor:
     def _schema_summary(self) -> dict[str, dict[str, float]]:
         return {name: {"min": b.min, "max": b.max, "default": b.default} for name, b in self.schema.bounds.items() if name in self._known_terms}
 
+    def _evaluation_snapshot(self, diag: dict[str, Any]) -> dict[str, Any]:
+        evaluation: dict[str, Any] = {
+            "llm_score": diag.get("score"),
+            "llm_confidence": diag.get("confidence"),
+        }
+        getter = self._callbacks.evaluation_getter
+        if getter is None:
+            return evaluation
+        try:
+            auxiliary = getter()
+        except Exception as exc:
+            evaluation["auxiliary_error"] = repr(exc)
+            return evaluation
+        if isinstance(auxiliary, dict):
+            evaluation["auxiliary"] = auxiliary
+        return evaluation
+
+    def _propose_patch(
+        self,
+        diag: dict[str, Any],
+        current_weights: dict[str, float],
+        *,
+        objective_block: str | None,
+        skill_block: str | None,
+    ) -> dict[str, Any]:
+        kwargs = {
+            "objective_block": objective_block,
+            "skill_block": skill_block,
+        }
+        try:
+            sig = inspect.signature(self.llm.propose)
+            supports_limits = (
+                "patch_limits" in sig.parameters
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            )
+        except (TypeError, ValueError):
+            supports_limits = True
+        if supports_limits:
+            kwargs["patch_limits"] = self._patch_limits(current_weights)
+        return self.llm.propose(
+            diag,
+            self._schema_summary(),
+            current_weights,
+            **kwargs,
+        )
+
+    def _patch_limits(self, current_weights: dict[str, float]) -> dict[str, Any]:
+        limits: dict[str, Any] = {
+            "_rules": {
+                "max_patch_fields": self.cfg.max_patch_fields,
+                "max_rel_change": self.cfg.max_rel_change,
+                "formula": "schema_min <= new_value <= schema_max and abs(new_value-current) <= max(abs(current), 1e-6)*max_rel_change",
+            }
+        }
+        for name in self._known_terms:
+            bound = self.schema.bounds.get(name)
+            if bound is None or name not in current_weights:
+                continue
+            current = float(current_weights[name])
+            delta = max(abs(current), 1e-6) * float(self.cfg.max_rel_change)
+            rel_min = current - delta
+            rel_max = current + delta
+            limits[name] = {
+                "current": current,
+                "schema_min": bound.min,
+                "schema_max": bound.max,
+                "allowed_next_min": max(bound.min, min(rel_min, rel_max)),
+                "allowed_next_max": min(bound.max, max(rel_min, rel_max)),
+            }
+        return limits
+
     def _distill_skill(
         self,
         *,
@@ -613,6 +703,7 @@ class Supervisor:
         current_weights: dict[str, float],
         diagnose: dict[str, Any],
         proposal: dict[str, Any],
+        evaluation: dict[str, Any] | None = None,
         outcome: dict[str, Any],
     ) -> None:
         if not self.skill_memory.should_update(current_iter):
@@ -624,6 +715,7 @@ class Supervisor:
             "current_weights": current_weights,
             "diagnose": diagnose,
             "proposal": proposal,
+            "evaluation": evaluation or {},
             "outcome": outcome,
         }
         try:

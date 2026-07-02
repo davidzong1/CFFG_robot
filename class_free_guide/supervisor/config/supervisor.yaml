@@ -87,7 +87,7 @@ schema_path: null
 skill_memory_enabled: true
 skill_memory_path: class_free_guide/supervisor/skill/SKILL.md
 skill_memory_min_update_iter: 1500
-skill_memory_max_chars: 12000
+skill_memory_max_chars: 20000
 # ---- Inter-process communication (IPC) --------------------------------------
 ipc_enabled: true
 ipc_topic: supervisor_status

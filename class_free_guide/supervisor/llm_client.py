@@ -76,6 +76,7 @@ class LLMClient(ABC):
         diagnose_result: dict[str, Any],
         schema_summary: dict[str, dict[str, float]],
         current_weights: dict[str, float],
+        patch_limits: dict[str, Any] | None = None,
         objective_block: str | None = None,
         skill_block: str | None = None,
     ) -> dict[str, Any]: ...
@@ -234,6 +235,7 @@ class ClaudeClient(LLMClient):
         diagnose_result: dict[str, Any],
         schema_summary: dict[str, dict[str, float]],
         current_weights: dict[str, float],
+        patch_limits: dict[str, Any] | None = None,
         objective_block: str | None = None,
         skill_block: str | None = None,
     ) -> dict[str, Any]:
@@ -245,6 +247,7 @@ class ClaudeClient(LLMClient):
                 {},
                 current_weights,
                 schema_summary=schema_summary,
+                patch_limits=patch_limits,
                 objective_block=objective_block,
                 skill_block=skill_block,
             )
@@ -253,7 +256,11 @@ class ClaudeClient(LLMClient):
         return _parse_json(text)
 
     def distill_skill(self, current_skill: str, cycle: dict[str, Any]) -> str:
-        body = _render_skill_distill_body(current_skill, cycle)
+        body = _render_skill_distill_body(
+            current_skill,
+            cycle,
+            max_chars=self.cfg.skill_memory_max_chars,
+        )
         return self._call(DISTILL_SKILL_SYSTEM, [{"type": "text", "text": body}])
 
     def test_connection(self, timeout: float = 30.0) -> bool:
@@ -380,6 +387,7 @@ class OpenAIClient(LLMClient):
         diagnose_result: dict[str, Any],
         schema_summary: dict[str, dict[str, float]],
         current_weights: dict[str, float],
+        patch_limits: dict[str, Any] | None = None,
         objective_block: str | None = None,
         skill_block: str | None = None,
     ) -> dict[str, Any]:
@@ -391,6 +399,7 @@ class OpenAIClient(LLMClient):
                 {},
                 current_weights,
                 schema_summary=schema_summary,
+                patch_limits=patch_limits,
                 objective_block=objective_block,
                 skill_block=skill_block,
             )
@@ -398,7 +407,11 @@ class OpenAIClient(LLMClient):
         return _parse_json(self._call(PROPOSE_SYSTEM, [{"type": "text", "text": body}]))
 
     def distill_skill(self, current_skill: str, cycle: dict[str, Any]) -> str:
-        body = _render_skill_distill_body(current_skill, cycle)
+        body = _render_skill_distill_body(
+            current_skill,
+            cycle,
+            max_chars=self.cfg.skill_memory_max_chars,
+        )
         return self._call(DISTILL_SKILL_SYSTEM, [{"type": "text", "text": body}])
 
     def test_connection(self, timeout: float = 30.0) -> bool:
@@ -588,7 +601,15 @@ class StubClient(LLMClient):
             "score": 0,
         }
 
-    def propose(self, diagnose_result, schema_summary, current_weights, objective_block=None, skill_block=None):
+    def propose(
+        self,
+        diagnose_result,
+        schema_summary,
+        current_weights,
+        patch_limits=None,
+        objective_block=None,
+        skill_block=None,
+    ):
         return {
             "rationale": "stub: no patch",
             "patch": {},
@@ -598,6 +619,55 @@ class StubClient(LLMClient):
 
     def distill_skill(self, current_skill: str, cycle: dict[str, Any]) -> str:
         return current_skill
+
+
+def _render_skill_distill_body(
+    current_skill: str,
+    cycle: dict[str, Any],
+    *,
+    max_chars: int,
+) -> str:
+    """Render the user message for persistent SKILL.md distillation."""
+    max_chars = max(1000, int(max_chars))
+    cycle_json = json.dumps(cycle, indent=2, default=str)
+    body = (
+        "## Current SKILL.md\n"
+        "```markdown\n"
+        f"{current_skill}\n"
+        "```\n\n"
+        "## Latest supervisor cycle evidence\n"
+        "```json\n"
+        f"{cycle_json}\n"
+        "```\n"
+    )
+    if len(body) <= max_chars:
+        return body
+
+    header_budget = 600
+    skill_budget = max(200, int((max_chars - header_budget) * 0.45))
+    cycle_budget = max(200, max_chars - header_budget - skill_budget)
+    body = (
+        "## Current SKILL.md\n"
+        "```markdown\n"
+        f"{_clip_text(current_skill, skill_budget)}\n"
+        "```\n\n"
+        "## Latest supervisor cycle evidence\n"
+        "```json\n"
+        f"{_clip_text(cycle_json, cycle_budget)}\n"
+        "```\n"
+    )
+    return body[:max_chars]
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    marker = "\n...[truncated]...\n"
+    if max_chars <= len(marker) + 20:
+        return text[:max_chars]
+    keep_head = (max_chars - len(marker)) // 2
+    keep_tail = max_chars - len(marker) - keep_head
+    return text[:keep_head] + marker + text[-keep_tail:]
 
 
 # ---------------------------------------------------------------------------

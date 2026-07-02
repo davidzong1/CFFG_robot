@@ -69,6 +69,21 @@ class VelocityOnPolicyRunner(MjlabOnPolicyRunner):
             self._ipc_msg_template = None
             self._ipc_topic_data = None
 
+    def close(self) -> None:
+        self.logger.stop_logging_writer()
+        self._close_ipc()
+
+    def _close_ipc(self) -> None:
+        self._ipc_sub = None
+        self._ipc_topic_data = None
+        self._ipc_msg_template = None
+        cleanup = getattr(dzipc, "CleanupIpcInstances", None)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+
     def _configure_multi_gpu(self):
         """Override parent to skip init_process_group when torchrunx already
         initialized the distributed process group (backend="nccl" in Launcher)."""
@@ -197,6 +212,7 @@ class VelocityOnPolicyRunner(MjlabOnPolicyRunner):
         if self.logger.writer is not None:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
             self.logger.stop_logging_writer()
+        self._close_ipc()
 
     def save(self, path: str, infos=None):
         super().save(path, infos)

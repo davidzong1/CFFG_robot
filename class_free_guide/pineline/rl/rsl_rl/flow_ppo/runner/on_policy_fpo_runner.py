@@ -112,6 +112,7 @@ class OnPolicyRunner:
             num_steps_per_env=train_cfg.num_steps_per_env,
         )
         self.current_learning_iteration = 0
+        self.latest_value_stats: dict[str, float | int] = {}
         self.early_stop_event = None  # threading.Event, set by supervisor when training should stop
         self._ipc_msg_template = None
         self._ipc_sub = None
@@ -138,6 +139,31 @@ class OnPolicyRunner:
             self._ipc_sub = None
             self._ipc_msg_template = None
             self._ipc_topic_data = None
+
+    def close(self) -> None:
+        print("[INFO] FPO runner close: closing logger...", flush=True)
+        self.logger.stop_logging_writer()
+        print("[INFO] FPO runner close: closing IPC...", flush=True)
+        self._close_ipc()
+        print("[INFO] FPO runner close: done.", flush=True)
+
+    def _close_ipc(self) -> None:
+        self._ipc_sub = None
+        self._ipc_topic_data = None
+        self._ipc_msg_template = None
+        cleanup = getattr(dzipc, "CleanupIpcInstances", None)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+
+    def get_value_evaluation(self) -> dict[str, float | int | str]:
+        return {
+            "source": "actor_critic_value",
+            "iteration": int(self.current_learning_iteration),
+            **self.latest_value_stats,
+        }
 
     @staticmethod
     def _process_obs_ret(obs_ret):
@@ -238,6 +264,7 @@ class OnPolicyRunner:
                     # Sample actions
                     action_start = time.perf_counter()
                     actions = self.alg.act(obs, privileged_obs)
+                    self._update_value_stats(self.alg.transition.values)
                     action_time += time.perf_counter() - action_start
 
                     # Step the environment
@@ -350,7 +377,29 @@ class OnPolicyRunner:
             self.run_post_training_checkpoint_eval()
 
         # Properly close the writer
+        print("[INFO] FPO runner cleanup: closing logger...", flush=True)
         self.logger.stop_logging_writer()
+        print("[INFO] FPO runner cleanup: logger closed.", flush=True)
+        print("[INFO] FPO runner cleanup: closing IPC...", flush=True)
+        self._close_ipc()
+        print("[INFO] FPO runner cleanup: IPC closed.", flush=True)
+
+    def _update_value_stats(self, values: torch.Tensor | None) -> None:
+        if values is None:
+            return
+        try:
+            flat = values.detach().float().reshape(-1)
+            if flat.numel() == 0:
+                return
+            self.latest_value_stats = {
+                "value_mean": float(flat.mean().item()),
+                "value_std": float(flat.std(unbiased=False).item()),
+                "value_min": float(flat.min().item()),
+                "value_max": float(flat.max().item()),
+                "num_values": int(flat.numel()),
+            }
+        except Exception:
+            pass
 
     def save(self, path: str, infos=None):
         # -- Prepare model state dict (use EMA if available)
@@ -615,6 +664,12 @@ class OnPolicyRunner:
             self.train_mode()
 
             # Clear GPU cache
+            try:
+                self.env.reset()
+            except Exception as reset_exc:
+                print(f"Warning: Failed to reset env after checkpoint eval: {reset_exc}", flush=True)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
             return eval_results

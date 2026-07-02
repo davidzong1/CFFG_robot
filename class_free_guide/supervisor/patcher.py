@@ -23,6 +23,7 @@ class AppliedPatch:
     expected_effect: str
     rollback_if: str
     diagnose: dict[str, Any] = field(default_factory=dict)
+    evaluation: dict[str, Any] = field(default_factory=dict)
 
 
 class RewardPatcher:
@@ -77,6 +78,7 @@ class RewardPatcher:
         current_iter: int,
         *,
         thinking_time: float | None = None,
+        evaluation: dict[str, Any] | None = None,
     ) -> AppliedPatch:
         before = {k: self.weight_getter(k) for k in patch.keys()}
         for name, new_val in patch.items():
@@ -93,6 +95,8 @@ class RewardPatcher:
             "expected_effect": expected_effect,
             "rollback_if": rollback_if,
         }
+        if evaluation is not None:
+            meta["evaluation"] = evaluation
         if thinking_time is not None:
             meta["thinking_time_s"] = round(thinking_time, 2)
         self._write_yaml(
@@ -111,6 +115,7 @@ class RewardPatcher:
             expected_effect=expected_effect,
             rollback_if=rollback_if,
             diagnose=diagnose,
+            evaluation=evaluation or {},
         )
         self.history.append(record)
         self._audit("applied", record)

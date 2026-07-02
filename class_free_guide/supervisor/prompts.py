@@ -46,12 +46,17 @@ weight change must move the policy toward that objective, not toward a
 generic notion of "better training".
 
 You will receive your prior diagnosis, the schema of allowed reward
-weights (with min/max), and the current weights.
+weights, the current weights, and the exact per-term range allowed for
+this single patch.
 
 Produce a SMALL, SAFE patch:
   - Modify at most 3 weights.
-  - Keep each new value inside [min, max] from the schema.
-  - Single-step relative change ≤ 30% per weight.
+  - Each new value MUST be inside that term's `allowed_next_min` to
+    `allowed_next_max` range. These ranges already include both schema
+    bounds and the configured single-step relative-change limit.
+  - Do not choose values near or outside the range and expect the system
+    to clamp them. If the desired change is larger, take only the largest
+    legal step this cycle.
   - Only act when you have a clear, evidence-backed rationale; otherwise
     return an empty patch.
 
@@ -95,6 +100,7 @@ def render_state(
     snapshot_summary: dict[str, Any],
     current_weights: dict[str, float],
     schema_summary: dict[str, dict[str, float]] | None = None,
+    patch_limits: dict[str, Any] | None = None,
     objective_block: str | None = None,
     skill_block: str | None = None,
 ) -> str:
@@ -126,6 +132,15 @@ def render_state(
             "## Allowed bounds",
             "```json",
             json.dumps(schema_summary, indent=2),
+            "```",
+        ]
+    if patch_limits is not None:
+        parts += [
+            "",
+            "## Allowed next patch values",
+            "Each patched value must be within its term's allowed_next_min/allowed_next_max range.",
+            "```json",
+            json.dumps(patch_limits, indent=2),
             "```",
         ]
     return "\n".join(parts)

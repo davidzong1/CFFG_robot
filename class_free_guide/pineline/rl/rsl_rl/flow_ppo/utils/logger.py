@@ -351,8 +351,15 @@ class Logger:
 
     def stop_logging_writer(self) -> None:
         """Stop the logging writer."""
-        if self.writer is not None and self.logger_type in ["neptune", "wandb"]:
-            self.writer.stop()  # type: ignore
+        writer = getattr(self, "writer", None)
+        if writer is None:
+            return
+        logger_type = getattr(self, "logger_type", "")
+        if logger_type in ["neptune", "wandb"] and hasattr(writer, "stop"):
+            writer.stop()  # type: ignore
+        elif hasattr(writer, "close"):
+            writer.close()
+        self.writer = None
 
     def _store_code_state(self) -> list[str]:
         """Store the current git diff of the code repositories involved in the experiment."""
